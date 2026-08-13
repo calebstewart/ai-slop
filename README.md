@@ -12,10 +12,17 @@ expectations, not so much.
 
 Agent skills live under `skills/`, one directory per skill, each with a `SKILL.md`
 following the [Agent Skills specification](https://agentskills.io/specification).
+Each skill also has a `README.md` — that's the human-readable one; `SKILL.md` is
+written for the agent.
 
 | Skill | Description |
 | --- | --- |
-| [`writing-skills`](skills/writing-skills/) | Guide for authoring high-quality Claude Code skills — writing `SKILL.md`, crafting the `description` field, choosing frontmatter, and structuring content with progressive disclosure. |
+| [`artisanal-slop`](skills/artisanal-slop/README.md) | Mostly-automated GitHub issue resolution loop — classify, plan, implement, independently review, and merge open issues continuously. A bash state machine owns the decision tree; sub-agents do the work in a pool of persistent git worktrees. |
+| [`writing-skills`](skills/writing-skills/README.md) | Guide for authoring high-quality Claude Code skills — writing `SKILL.md`, crafting the `description` field, choosing frontmatter, and structuring content with progressive disclosure. |
+
+`artisanal-slop` ships an executable driver at `bin/artisanal-slop`. Whichever install
+method you use, check the mode survived it — `chmod +x ~/.claude/skills/artisanal-slop/bin/artisanal-slop`
+if it didn't.
 
 ## Installing skills
 

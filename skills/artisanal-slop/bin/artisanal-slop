@@ -1,0 +1,2390 @@
+#!/usr/bin/env bash
+#
+# artisanal-slop — the deterministic state machine behind the /artisanal-slop skill.
+#
+# The orchestrating Claude session does not decide *what happens next*; this script
+# does. The session's loop is:
+#
+#     artisanal-slop next            -> one ACTION block
+#     <execute it with Agent / AskUserQuestion / SendMessage>
+#     artisanal-slop record ...      -> transition (the THEN: line of the ACTION block)
+#     artisanal-slop next            -> ...
+#
+# Everything mechanical lives here: status bookkeeping, the concurrency cap, review
+# round counting and the park rule, severity ranking, reviewer tiering, prompt
+# rendering, the `gh` sequences for close/merge/label, CI polling, and the post-merge
+# sibling-conflict scan. The model contributes only judgment (classification, plans,
+# code, review verdicts) and the two human approval gates.
+#
+# Dependencies: bash 4+, git, gh (its embedded --jq is used for all JSON), coreutils.
+# No jq/python/node required.
+#
+# State lives in a plain file tree so it is inspectable, diffable, and needs no
+# JSON parser:
+#
+#     $STATE/meta/{repo,default_branch,root,started_at,cap,docs_phase,docs_pr}
+#     $STATE/issues/<N>/{status,category,category_src,title,pr,pr_url,branch,cluster,
+#                        rounds,agent_impl,agent_active,blocked_by,held_from,log}
+#     $STATE/issues/<N>/blob/       free text (plan.md, close-comment.md, findings-R.md)
+#     $STATE/issues/<N>/pending     a queued ACTION block, emitted by `next` first
+#     $STATE/docnotes/issue-<N>.md  deferred agent-doc suggestions, landed in one final PR
+#     $STATE/work/                  scratch for rendered prompts and inputs
+
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Constants and small helpers
+# ---------------------------------------------------------------------------
+
+SELF="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/$(basename -- "${BASH_SOURCE[0]}")"
+SKILL_DIR="$(cd -- "$(dirname -- "$SELF")/.." && pwd)"
+TEMPLATE_DIR="$SKILL_DIR/templates"
+
+# Statuses that occupy a concurrency slot. Per the skill's rule, planning counts and
+# so does awaiting-approval: an issue whose approval is pending may still need
+# follow-up work, so it is not free capacity. `held` counts too, deliberately: a held
+# issue keeps its slot, branch, and warm cache, and holding capacity is exactly what
+# serializing entangled work means.
+INFLIGHT_STATUSES="planning planned implementing in-review ci-pending awaiting-merge awaiting-close held"
+TERMINAL_STATUSES="merged closed skipped failed"
+
+MAX_ROUNDS="${ARTISANAL_SLOP_MAX_ROUNDS:-3}"
+DEFAULT_CAP="${ARTISANAL_SLOP_MAX_INFLIGHT:-2}"
+
+# Agent-guidance files. Every issue PR is tempted to touch them, and because they are
+# shared they conflict with sibling PRs and with the maintainer's own branches — a
+# conflict that costs a stopped reviewer and a restarted implementer to clear. So
+# incidental edits to them never ride along with a fix: agents append their suggestions
+# to a note file and one end-of-loop PR, attached to no issue, applies them together.
+# Prefixes, matched against paths from `git diff --name-only`.
+DEFERRED_DOCS="${ARTISANAL_SLOP_DEFERRED_DOCS:-CLAUDE.md AGENTS.md .claude/ .cursor/rules .cursorrules .github/copilot-instructions.md .github/instructions/}"
+
+die() { printf 'artisanal-slop: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'artisanal-slop: %s\n' "$*" >&2; }
+
+category_name() {
+  case "$1" in
+    1) echo "security vulnerability" ;;
+    2) echo "crash / panic / hang" ;;
+    3) echo "correctness bug" ;;
+    4) echo "CI / tooling / release defect" ;;
+    5) echo "docs / metadata / help text" ;;
+    *) echo "unclassified" ;;
+  esac
+}
+
+# Categories 1-3 get the expensive executing review; 4-5 get a Sonnet diff read.
+# This is the one place that mapping is defined.
+review_tier_model() { [ "${1:-5}" -le 3 ] && echo opus || echo sonnet; }
+review_is_executing() { [ "${1:-5}" -le 3 ]; }
+
+# ---------------------------------------------------------------------------
+# State directory resolution
+# ---------------------------------------------------------------------------
+
+resolve_state_dir() {
+  if [ -n "${ARTISANAL_SLOP_STATE_DIR:-}" ]; then
+    STATE="$ARTISANAL_SLOP_STATE_DIR"
+    return
+  fi
+  local slug
+  slug="$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null || true)"
+  [ -n "$slug" ] || die "not in a GitHub repo (and ARTISANAL_SLOP_STATE_DIR is unset)"
+  STATE="$HOME/.claude/artisanal-slop/${slug//\//__}"
+}
+
+require_state() {
+  resolve_state_dir
+  [ -d "$STATE/meta" ] || die "no state at $STATE — run 'artisanal-slop init' first"
+  REPO="$(cat "$STATE/meta/repo")"
+  DEFAULT_BRANCH="$(cat "$STATE/meta/default_branch")"
+  ROOT="$(cat "$STATE/meta/root")"
+  # The stored value is the persistent one; the env var is a one-shot override for a
+  # single invocation. `cap` reports when an override is masking the stored value, so
+  # an exported variable can't silently make `cap N` look like a no-op.
+  if [ -n "${ARTISANAL_SLOP_MAX_INFLIGHT:-}" ]; then
+    CAP="$ARTISANAL_SLOP_MAX_INFLIGHT"; CAP_SRC="env ARTISANAL_SLOP_MAX_INFLIGHT"
+  else
+    CAP="$(cat "$STATE/meta/cap")"; CAP_SRC="stored"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Per-issue accessors
+# ---------------------------------------------------------------------------
+
+idir() { echo "$STATE/issues/$1"; }
+
+get() { # get <issue> <key> [default]
+  local f; f="$(idir "$1")/$2"
+  if [ -f "$f" ]; then cat "$f"; else printf '%s' "${3-}"; fi
+}
+
+put() { # put <issue> <key> <value>
+  local d; d="$(idir "$1")"
+  mkdir -p "$d"
+  printf '%s' "$3" > "$d/$2"
+}
+
+# A short human label for an issue, used to name its sub-agents in the harness UI
+# ("Planning #12: seek offset overflow"). The classifier writes it in the same pass
+# that assigns the category; issues that never reached it — defaulted or reconciled —
+# fall back to a trimmed title, which is always set.
+issue_slug() { # issue_slug <issue>
+  local s; s="$(get "$1" slug "")"
+  if [ -z "$s" ]; then
+    s="$(get "$1" title "")"
+    # Drop a short conventional prefix ("fix:", "bug(parser):") but not a real colon
+    # clause in the middle of a sentence.
+    local pfx='^[A-Za-z0-9_./ -]{1,15}(\([^)]*\))?: '
+    [[ "$s" =~ $pfx ]] && s="${s#*: }"
+  fi
+  # Six words, 48 chars: the harness renders this in a narrow column.
+  s="$(printf '%s' "$s" | tr '\n\t' '  ' \
+       | awk '{ for (i = 1; i <= NF && i <= 6; i++) printf "%s%s", (i > 1 ? " " : ""), $i }')"
+  printf '%s' "${s:0:48}"
+}
+
+# The DESCRIPTION line of a spawn-agent block — what the harness labels the agent.
+agent_label() { # agent_label <verb> <issue>
+  local slug; slug="$(issue_slug "$2")"
+  printf '%s #%s%s' "$1" "$2" "${slug:+: $slug}"
+}
+
+note() { # note <issue> <message>  — append to the per-issue audit log
+  printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$2" >> "$(idir "$1")/log"
+}
+
+set_status() { # set_status <issue> <status> [reason]
+  local old; old="$(get "$1" status "")"
+  put "$1" status "$2"
+  note "$1" "status: ${old:-none} -> $2${3:+ ($3)}"
+}
+
+all_issues() {
+  [ -d "$STATE/issues" ] || return 0
+  local d
+  for d in "$STATE/issues"/*/; do
+    [ -d "$d" ] || continue
+    basename "$d"
+  done | sort -n
+}
+
+issues_with_status() { # issues_with_status <status>...
+  local n s want
+  for n in $(all_issues); do
+    s="$(get "$n" status "")"
+    for want in "$@"; do
+      if [ "$s" = "$want" ]; then echo "$n"; break; fi
+    done
+  done
+  # Must not inherit the last test's status: `set -o pipefail` would otherwise turn a
+  # no-match into a pipeline failure and `set -e` would kill the caller.
+  return 0
+}
+
+inflight_count() {
+  # shellcheck disable=SC2086
+  issues_with_status $INFLIGHT_STATUSES | wc -l | tr -d ' '
+}
+
+# Eligible work, best first: severity category ascending, then issue number
+# ascending. `--start N` at init pins one issue to the front by giving it rank 0.
+eligible_sorted() {
+  local n
+  for n in $(issues_with_status classified); do
+    printf '%s %s\n' "$(get "$n" rank "$(get "$n" category 9)")" "$n"
+  done | sort -k1,1n -k2,2n | awk '{print $2}'
+}
+
+# Cluster keys group issues the classifier expects to edit the same files. Two issues
+# in one cluster are never in flight at the same time: the second one's PR would be
+# rebased, re-reviewed, and often re-planned the moment the first merges, and that
+# rework costs far more than the wall-clock the parallelism saved.
+cluster_busy() { # cluster_busy <key> -> 0 if an in-flight issue holds that cluster
+  local key="$1" n
+  [ -n "$key" ] || return 1
+  [ "${ARTISANAL_SLOP_NO_CLUSTERS:-0}" = 1 ] && return 1
+  # shellcheck disable=SC2086
+  for n in $(issues_with_status $INFLIGHT_STATUSES); do
+    [ "$(get "$n" cluster "")" = "$key" ] && return 0
+  done
+  return 1
+}
+
+# The best-ranked eligible issue that is actually startable right now. Differs from
+# eligible_sorted only when a cluster-mate is already in flight.
+next_startable() {
+  local n
+  for n in $(eligible_sorted); do
+    cluster_busy "$(get "$n" cluster "")" && continue
+    echo "$n"
+    return 0
+  done
+  return 0
+}
+
+note_global() { printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$STATE/log"; }
+
+# ---------------------------------------------------------------------------
+# Worktree pool
+#
+# `isolation: "worktree"` on the Agent tool makes a *fresh* worktree per agent, so
+# every planner, implementer, and reviewer starts with an empty build cache. On a
+# Rust repo that is a cold compile of every dependency, and the reviewer's granular
+# revert check pays it once per reverted file. So the script keeps a small pool of
+# long-lived worktrees instead, and agents are spawned without harness isolation and
+# told which slot is theirs.
+#
+# A slot is leased to an *issue*, not to an agent, for the whole pipeline: the
+# planner warms the cache, the implementer inherits it, and the reviewer's repeated
+# reverts become incremental rebuilds. Pool size is therefore exactly the concurrency
+# cap — no new concurrency dimension.
+#
+# The tradeoff to know about: harness isolation is enforced, a prompt instruction is
+# not. assert_root_clean() is the guard against an agent that ignores its slot.
+# ---------------------------------------------------------------------------
+
+# Preserved across slot resets. Build caches are the entire point of the pool and
+# `git clean -xdf` would otherwise delete them.
+POOL_KEEP="${ARTISANAL_SLOP_POOL_KEEP:-target node_modules .venv .direnv .pytest_cache result}"
+
+slot_path() { echo "$STATE/pool/slot-$1"; }
+slot_lease() { echo "$STATE/pool/slot-$1.lease"; }
+
+# Every slot that exists or could be handed out. Lowering the cap must not make slots
+# above the new value invisible to `pool list`/`prune` — they may still be leased by
+# in-flight issues, and once released they still need pruning to reclaim their disk.
+all_slots() {
+  local k d
+  for k in $(seq 1 "$CAP"); do echo "$k"; done
+  if [ -d "$STATE/pool" ]; then
+    for d in "$STATE/pool"/slot-*/; do
+      [ -d "$d" ] || continue
+      d="$(basename "$d")"; echo "${d#slot-}"
+    done
+  fi
+  return 0
+}
+pool_slots() { all_slots | sort -n -u; }
+
+pool_ensure_slot() { # pool_ensure_slot <k>
+  local k="$1" p; p="$(slot_path "$k")"
+  # A worktree's .git is a file, not a directory.
+  { [ -e "$p/.git" ]; } && return 0
+  mkdir -p "$STATE/pool"
+  git -C "$ROOT" fetch origin --quiet 2>/dev/null || true
+  git -C "$ROOT" worktree add --detach "$p" "origin/$DEFAULT_BRANCH" >/dev/null 2>&1 \
+    || die "could not create pool slot $k at $p"
+  note_global "created pool slot $k at $p"
+  return 0
+}
+
+pool_acquire() { # pool_acquire <issue> -> prints the slot path
+  local n="$1" k existing
+  existing="$(get "$n" slot "")"
+  if [ -n "$existing" ]; then
+    pool_ensure_slot "$existing"
+    slot_path "$existing"
+    return 0
+  fi
+  for k in $(seq 1 "$CAP"); do
+    if [ ! -s "$(slot_lease "$k")" ]; then
+      pool_ensure_slot "$k"
+      printf '%s' "$n" > "$(slot_lease "$k")"
+      put "$n" slot "$k"
+      note "$n" "leased pool slot $k"
+      slot_path "$k"
+      return 0
+    fi
+  done
+  die "no free pool slot (cap=$CAP). Inspect with '$SELF pool list'."
+}
+
+pool_release() { # pool_release <issue>
+  local n="$1" k; k="$(get "$n" slot "")"
+  [ -n "$k" ] || return 0
+  rm -f "$(slot_lease "$k")"
+  put "$n" slot ""
+  note "$n" "released pool slot $k"
+  return 0
+}
+
+# Scrub one slot back to a usable working tree, keeping its build cache, and refresh
+# its remote refs. Leaves HEAD where it was; callers decide what to check out.
+slot_reset() { # slot_reset <k>
+  local k="$1" p gitdir x
+  p="$(slot_path "$k")"
+  pool_ensure_slot "$k"
+
+  # An agent killed mid-operation can leave a rebase in progress or an index lock
+  # behind. None of that should poison the next stage.
+  gitdir="$(git -C "$p" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  [ -n "$gitdir" ] && rm -f "$gitdir/index.lock"
+  git -C "$p" rebase --abort      >/dev/null 2>&1 || true
+  git -C "$p" merge --abort       >/dev/null 2>&1 || true
+  git -C "$p" cherry-pick --abort >/dev/null 2>&1 || true
+  git -C "$p" reset --hard        >/dev/null 2>&1 || true
+
+  local -a keep=()
+  for x in $POOL_KEEP; do keep+=(-e "$x"); done
+  git -C "$p" clean -xdf "${keep[@]}" >/dev/null 2>&1 || true
+
+  git -C "$p" fetch origin --prune --quiet 2>/dev/null || true
+  return 0
+}
+
+# Put a leased slot into a known state before handing it to an agent.
+#   base   -> detached at origin/<default>, for planners
+#   branch -> the issue's PR branch, hard-reset to origin
+pool_prepare() { # pool_prepare <issue> <base|branch>
+  local n="$1" mode="$2" k p br
+  k="$(get "$n" slot "")"; [ -n "$k" ] || return 0
+  p="$(slot_path "$k")"
+  slot_reset "$k"
+
+  if [ "$mode" = branch ]; then
+    br="$(get "$n" branch "")"
+    if [ -n "$br" ] && git -C "$p" rev-parse --verify --quiet "origin/$br" >/dev/null 2>&1; then
+      git -C "$p" checkout -B "$br" "origin/$br" >/dev/null 2>&1 \
+        || die "pool slot $k: could not check out $br"
+      note "$n" "slot $k prepared on $br"
+      return 0
+    fi
+  fi
+  git -C "$p" checkout --detach "origin/$DEFAULT_BRANCH" >/dev/null 2>&1 \
+    || die "pool slot $k: could not detach at origin/$DEFAULT_BRANCH"
+  note "$n" "slot $k prepared at origin/$DEFAULT_BRANCH"
+  return 0
+}
+
+# Rebase an *idle* slot onto the moved default branch. Because the slot persists, a
+# conflict is a real `git rebase` exit code rather than GitHub's asynchronous
+# `mergeable` field, which removes the UNKNOWN-polling guesswork entirely.
+#   0 = rebased cleanly and force-pushed, 1 = conflicted (aborted), 2 = nothing to do
+pool_rebase() { # pool_rebase <issue>
+  local n="$1" k p br
+  k="$(get "$n" slot "")"; [ -n "$k" ] || return 2
+  br="$(get "$n" branch "")"; [ -n "$br" ] || return 2
+  p="$(slot_path "$k")"
+  pool_ensure_slot "$k"
+  git -C "$p" fetch origin --prune --quiet 2>/dev/null || true
+  git -C "$p" rev-parse --verify --quiet "origin/$br" >/dev/null 2>&1 || return 2
+  git -C "$p" checkout -B "$br" "origin/$br" >/dev/null 2>&1 || return 2
+  if git -C "$p" rebase "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
+    git -C "$p" push --force-with-lease origin "$br" >/dev/null 2>&1 || return 1
+    return 0
+  fi
+  git -C "$p" rebase --abort >/dev/null 2>&1 || true
+  return 1
+}
+
+# The pool trades an enforced guarantee for a prompt instruction, so verify the thing
+# that guarantee was protecting: the root checkout must never be modified.
+assert_root_clean() {
+  [ "${ARTISANAL_SLOP_ALLOW_DIRTY_ROOT:-0}" = 1 ] && return 0
+  local dirty; dirty="$(git -C "$ROOT" status --porcelain 2>/dev/null | head -10)"
+  if [ -n "$dirty" ]; then
+    warn "the repo root at $ROOT has uncommitted changes:"
+    printf '%s\n' "$dirty" >&2
+    die "an agent wrote to the repo root instead of its pool slot. The root must stay clean on $DEFAULT_BRANCH — investigate before continuing (override with ARTISANAL_SLOP_ALLOW_DIRTY_ROOT=1)."
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Change-set inspection
+#
+# Used for two things: enforcing the deferred-docs rule, and deciding after a merge
+# which siblings could possibly have been affected. Both want the same question
+# answered — which files does this change touch — so it lives in one place.
+# ---------------------------------------------------------------------------
+
+# Every path a branch changes relative to the default branch. Reads the slot when there
+# is one (no network), falling back to the PR diff.
+issue_files() { # issue_files <issue>
+  local n="$1" k br pr out repo
+  k="$(get "$n" slot "")"; br="$(get "$n" branch "")"; pr="$(get "$n" pr "")"
+  if [ -n "$br" ]; then
+    # Either the issue's own slot or the root checkout can answer this; both are local.
+    for repo in "${k:+$(slot_path "$k")}" "$ROOT"; do
+      [ -n "$repo" ] && [ -e "$repo/.git" ] || continue
+      git -C "$repo" fetch origin --quiet 2>/dev/null || true
+      git -C "$repo" rev-parse --verify --quiet "origin/$br" >/dev/null 2>&1 || continue
+      out="$(git -C "$repo" diff --name-only "origin/$DEFAULT_BRANCH...origin/$br" 2>/dev/null || true)"
+      [ -n "$out" ] || continue
+      printf '%s\n' "$out"
+      return 0
+    done
+  fi
+  [ -n "$pr" ] && gh pr diff "$pr" --name-only 2>/dev/null
+  return 0
+}
+
+pr_files() { # pr_files <pr>
+  gh pr diff "$1" --name-only 2>/dev/null || true
+}
+
+# Paths a plan intends to change, for an issue whose branch does not exist yet. A plan
+# names its files as `path/to/file.rs:120`, in backticks, or bare; this is a heuristic
+# and its consumers treat "no answer" as "assume overlap".
+planned_files() { # planned_files <issue>
+  local f; f="$(idir "$1")/blob/plan.md"
+  [ -f "$f" ] || return 0
+  grep -oE '[A-Za-z0-9_][A-Za-z0-9_./-]*\.[A-Za-z0-9]+' "$f" 2>/dev/null \
+    | grep -E '/|\.(rs|go|py|ts|tsx|js|jsx|c|h|cc|cpp|java|rb|sh|md|toml|yaml|yml|json)$' \
+    | sort -u || true
+}
+
+# Paths in common between two newline-separated file lists (given as files).
+shared_paths() { # shared_paths <list-a> <list-b>
+  comm -12 <(sort -u "$1" 2>/dev/null) <(sort -u "$2" 2>/dev/null) 2>/dev/null || true
+}
+
+# Deferred agent-guidance paths present in a list of changed files (given on stdin).
+filter_deferred_docs() {
+  local line pfx
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    for pfx in $DEFERRED_DOCS; do
+      case "$line" in
+        "$pfx"|"$pfx"*) printf '%s\n' "$line"; break ;;
+      esac
+    done
+  done
+  return 0
+}
+
+# Deferred agent-guidance files an issue's branch touches. A prompt instruction is not
+# enforcement, so the rule is verified where the branch first becomes reviewable.
+deferred_docs_touched() { # deferred_docs_touched <issue>
+  [ "$(get "$1" docs_exempt "")" = 1 ] && return 0
+  issue_files "$1" | filter_deferred_docs
+  return 0
+}
+
+# The render flag that turns on the deferral section in the agent templates. An issue
+# whose subject *is* an agent-guidance file must not be told to leave it alone.
+docs_flag() { # docs_flag <issue>
+  [ "$(get "$1" docs_exempt "")" = 1 ] || printf 'DOCS_DEFERRED'
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Template rendering
+#
+# Placeholders:
+#   {{KEY}}                 scalar substitution (pure bash, no escaping hazards)
+#   {{FILE:/abs/path}}      alone on a line: splice that file's contents verbatim
+#   {{#FLAG}} ... {{/FLAG}} keep the block only when FLAG is in $RENDER_FLAGS
+#
+# Free text (plans, findings, issue bodies) is *always* moved through files, never
+# through argv or sed, so no amount of backticks or quotes in an issue body can
+# corrupt a prompt.
+# ---------------------------------------------------------------------------
+
+declare -A RVARS
+RENDER_FLAGS=""
+
+rset() { RVARS["$1"]="$2"; }
+
+render() { # render <template-name> <out-file>
+  local tpl="$TEMPLATE_DIR/$1" out="$2"
+  [ -f "$tpl" ] || die "missing template: $tpl"
+  mkdir -p "$(dirname "$out")"
+  : > "$out"
+
+  local line key val skip_depth=0
+  while IFS= read -r line || [ -n "$line" ]; do
+    # Conditional block markers.
+    if [[ "$line" =~ ^[[:space:]]*\{\{#([A-Z_]+)\}\}[[:space:]]*$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      if [ "$skip_depth" -gt 0 ] || [[ " $RENDER_FLAGS " != *" $key "* ]]; then
+        skip_depth=$((skip_depth + 1))
+      else
+        skip_depth=0
+        RENDER_OPEN=$((${RENDER_OPEN:-0} + 1))
+      fi
+      continue
+    fi
+    if [[ "$line" =~ ^[[:space:]]*\{\{/([A-Z_]+)\}\}[[:space:]]*$ ]]; then
+      [ "$skip_depth" -gt 0 ] && skip_depth=$((skip_depth - 1))
+      continue
+    fi
+    [ "$skip_depth" -gt 0 ] && continue
+
+    # Whole-file splice.
+    if [[ "$line" =~ ^[[:space:]]*\{\{FILE:(.+)\}\}[[:space:]]*$ ]]; then
+      val="${BASH_REMATCH[1]}"
+      for k in "${!RVARS[@]}"; do val="${val//\{\{$k\}\}/${RVARS[$k]}}"; done
+      if [ -f "$val" ]; then cat "$val" >> "$out"; else echo "(missing: $val)" >> "$out"; fi
+      continue
+    fi
+
+    for k in "${!RVARS[@]}"; do line="${line//\{\{$k\}\}/${RVARS[$k]}}"; done
+    printf '%s\n' "$line" >> "$out"
+  done < "$tpl"
+}
+
+# Seed the render vars every template can rely on.
+rvars_for() { # rvars_for <issue>
+  local n="$1" cat; cat="$(get "$n" category 5)"
+  rset ISSUE "$n"
+  rset REPO "$REPO"
+  rset DEFAULT_BRANCH "$DEFAULT_BRANCH"
+  rset STATE_DIR "$STATE"
+  rset ISSUE_DIR "$(idir "$n")"
+  rset BLOB_DIR "$(idir "$n")/blob"
+  rset TITLE "$(get "$n" title "")"
+  rset CATEGORY "$cat"
+  rset CATEGORY_NAME "$(category_name "$cat")"
+  rset PR "$(get "$n" pr "")"
+  rset PR_URL "$(get "$n" pr_url "")"
+  rset BRANCH "$(get "$n" branch "issue-$n")"
+  rset ROUND "$(get "$n" rounds 0)"
+  rset MAX_ROUNDS "$MAX_ROUNDS"
+  local slot; slot="$(get "$n" slot "")"
+  rset WORKTREE "${slot:+$(slot_path "$slot")}"
+  # The deferred-docs list lives in one place — here — so no template hardcodes it.
+  # Templates put it in a code span, so render it as prose rather than as argv.
+  rset DEFERRED_DOCS "$(printf '%s' "$DEFERRED_DOCS" | sed 's/  */, /g')"
+  rset DOCNOTE_FILE "$STATE/docnotes/issue-$n.md"
+  mkdir -p "$(idir "$n")/blob" "$STATE/docnotes"
+}
+
+# ---------------------------------------------------------------------------
+# ACTION emission
+# ---------------------------------------------------------------------------
+
+emit() { printf '%s\n' "$*"; }
+
+# Stash an ACTION block to be emitted by the next `next` call, ahead of everything
+# else. This is how a `record` that implies immediate follow-up work (relay findings,
+# rebase after a sibling merge) hands that work back to the model.
+queue_pending() { # queue_pending <issue> <<< "action block"
+  cat > "$(idir "$1")/pending"
+}
+
+clear_pending() { rm -f "$(idir "$1")/pending"; }
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+  local start="" cap="$DEFAULT_CAP" cap_explicit=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --start) start="$2"; shift 2 ;;
+      --cap) cap="$2"; cap_explicit=1; shift 2 ;;
+      *) die "init: unknown flag $1" ;;
+    esac
+  done
+
+  resolve_state_dir
+  local repo branch root
+  repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+  branch="$(gh repo view --json defaultBranchRef --jq .defaultBranchRef.name)"
+  root="$(git rev-parse --show-toplevel)"
+
+  mkdir -p "$STATE/meta" "$STATE/issues" "$STATE/work"
+  printf '%s' "$repo"   > "$STATE/meta/repo"
+  printf '%s' "$branch" > "$STATE/meta/default_branch"
+  printf '%s' "$root"   > "$STATE/meta/root"
+  # `init` is re-run mid-session to pick up newly filed issues, so it must not quietly
+  # reset a cap the user changed with `cap N`. Only an explicit --cap overwrites it.
+  if [ -n "$cap_explicit" ] || [ ! -f "$STATE/meta/cap" ]; then
+    printf '%s' "$cap" > "$STATE/meta/cap"
+  else
+    cap="$(cat "$STATE/meta/cap")"
+  fi
+  [ -f "$STATE/meta/started_at" ] || date -u +%Y-%m-%dT%H:%M:%SZ > "$STATE/meta/started_at"
+
+  REPO="$repo"; DEFAULT_BRANCH="$branch"; ROOT="$root"; CAP="$cap"
+
+  # Seed the queue. Existing issue dirs are left alone so init is idempotent and
+  # safe to re-run mid-session to pick up newly filed issues.
+  local added=0 n title labels
+  while IFS=$'\t' read -r n title labels; do
+    [ -n "$n" ] || continue
+    if [ -d "$(idir "$n")" ]; then continue; fi
+    mkdir -p "$(idir "$n")/blob"
+    put "$n" title "$title"
+    put "$n" labels "$labels"
+    if [[ "$labels" == *"needs-human"* ]]; then
+      set_status "$n" parked "carries the needs-human label"
+    else
+      set_status "$n" queued "seeded from gh issue list"
+    fi
+    added=$((added + 1))
+  done < <(gh issue list --state open --limit 200 \
+             --json number,title,labels \
+             --jq '.[] | [.number, .title, ([.labels[].name] | join(","))] | @tsv')
+
+  if [ -n "$start" ]; then
+    [ -d "$(idir "$start")" ] || die "init: --start $start is not an open issue"
+    put "$start" rank 0
+    note "$start" "pinned to front of queue by --start"
+  fi
+
+  emit "STATE_DIR: $STATE"
+  emit "REPO: $repo"
+  emit "DEFAULT_BRANCH: $branch"
+  emit "CAP: $cap"
+  emit "SEEDED: $added new issue(s)"
+  emit ""
+  emit "NEXT: $SELF next"
+}
+
+# ---------------------------------------------------------------------------
+# next — the whole decision tree, in priority order
+# ---------------------------------------------------------------------------
+
+cmd_next() {
+  require_state
+  assert_root_clean
+
+  local n inflight eligible startable
+
+  # 0. Follow-up work queued by a previous `record` always wins. This is how
+  #    review findings, CI failures, and post-merge rebases get relayed promptly.
+  for n in $(all_issues); do
+    if [ -f "$(idir "$n")/pending" ]; then
+      cat "$(idir "$n")/pending"
+      return 0
+    fi
+  done
+
+  inflight="$(inflight_count)"
+  eligible="$(eligible_sorted | head -1)"
+  # An issue whose cluster-mate is already in flight is not startable, and "not
+  # startable" is what the never-block-on-a-human rule below actually cares about.
+  startable="$(next_startable)"
+
+  # 1. Approvals, but only once the pipeline is primed — i.e. only when we cannot
+  #    start more work anyway. This is the "never block work on a human" rule,
+  #    enforced arithmetically instead of remembered.
+  local pending_approvals
+  pending_approvals="$(issues_with_status awaiting-merge awaiting-close | tr '\n' ' ')"
+  if [ -n "${pending_approvals// /}" ]; then
+    if [ "$inflight" -ge "$CAP" ] || [ -z "$startable" ]; then
+      emit_approvals $pending_approvals
+      return 0
+    fi
+  fi
+
+  # 2. Unclassified issues block ranking, so classify before selecting.
+  local unclassified
+  unclassified="$(issues_with_status queued | tr '\n' ' ')"
+  if [ -n "${unclassified// /}" ]; then
+    emit_classify $unclassified
+    return 0
+  fi
+
+  # 3. CI results are cheap to check and gate merge questions.
+  local ci
+  ci="$(issues_with_status ci-pending | head -1)"
+  if [ -n "$ci" ]; then
+    emit_poll_ci "$ci"
+    return 0
+  fi
+
+  # 4. Room in the pipeline and work waiting -> start the best-ranked startable issue.
+  if [ "$inflight" -lt "$CAP" ] && [ -n "$startable" ]; then
+    emit_spawn_plan "$startable"
+    return 0
+  fi
+
+  # 5. Approvals we deferred at step 1 because there was work to start, but the
+  #    cap is now full.
+  if [ -n "${pending_approvals// /}" ]; then
+    emit_approvals $pending_approvals
+    return 0
+  fi
+
+  # 6. Everything that can run is running.
+  if [ "$inflight" -gt 0 ]; then
+    emit "ACTION: wait"
+    emit "REASON: $inflight issue(s) in flight with background agents; nothing to start."
+    emit "IN_FLIGHT: $(issues_with_status $INFLIGHT_STATUSES | tr '\n' ' ')"
+    if [ -n "$eligible" ] && [ -z "$startable" ]; then
+      emit "SERIALIZED: #$eligible is next but shares cluster '$(get "$eligible" cluster)' with an in-flight issue; it starts when that one lands."
+    fi
+    emit ""
+    emit "Wait for the next background-agent completion notification, then run the"
+    emit "matching '$SELF record ...' for it. Do not poll in a loop."
+    return 0
+  fi
+
+  # 7. The queue is drained. Everything the agents deferred to the end — agent-guidance
+  #    doc changes — lands now, in one PR attached to no issue.
+  local phase; phase="$(cat "$STATE/meta/docs_phase" 2>/dev/null || true)"
+  case "$phase" in
+    spawned)
+      emit "ACTION: wait"
+      emit "REASON: the end-of-loop documentation agent is still running."
+      emit ""
+      emit "When it reports, run '$SELF record docs-done --pr <num> --url <url>' — or"
+      emit "'$SELF record docs-none --reason \"<why>\"' if it concluded there was nothing"
+      emit "worth landing."
+      return 0 ;;
+    awaiting-merge)
+      emit_docs_approval
+      return 0 ;;
+    done|skipped|left-open) : ;;
+    *)
+      if docnotes_pending; then
+        emit_spawn_docs
+        return 0
+      fi ;;
+  esac
+
+  emit "ACTION: done"
+  emit "REASON: queue empty and nothing in flight."
+  emit ""
+  emit "THEN: $SELF summary"
+}
+
+emit_classify() {
+  local input="$STATE/work/classify-input.md" out="$STATE/work/classify-prompt.md"
+  local list="$*"
+
+  # One batch pass over every unclassified issue: cheap model, one call, and the
+  # ranking that consumes the result is deterministic.
+  : > "$input"
+  local n
+  for n in $list; do
+    {
+      printf '===== ISSUE %s =====\n' "$n"
+      gh issue view "$n" --json number,title,labels,body \
+        --jq '"TITLE: \(.title)\nLABELS: \([.labels[].name] | join(", "))\nBODY:\n\(.body[0:1500])"' \
+        2>/dev/null || printf 'TITLE: %s\n(body unavailable)\n' "$(get "$n" title "")"
+      printf '\n'
+    } >> "$input"
+  done
+
+  RENDER_FLAGS=""
+  RVARS=()
+  rset REPO "$REPO"
+  rset ISSUE_LIST "$list"
+  rset INPUT_FILE "$input"
+  rset OUT_FILE "$STATE/work/classify-result.txt"
+  render classify.md "$out"
+
+  local count; count="$(set -- $list; echo $#)"
+
+  emit "ACTION: spawn-agent"
+  emit "STAGE: classify"
+  emit "ISSUES: $list"
+  emit "DESCRIPTION: Classifying $count issue$([ "$count" = 1 ] || echo s)"
+  emit "MODEL: haiku"
+  emit "SUBAGENT_TYPE: general-purpose"
+  emit "BACKGROUND: false"
+  emit "ISOLATION: none"
+  emit "PROMPT_FILE: $out"
+  emit "PROMPT: Follow the instructions in $out exactly. That file is your complete brief."
+  emit ""
+  emit "THEN: $SELF record classified --from-file $STATE/work/classify-result.txt"
+}
+
+emit_spawn_plan() {
+  local n="$1" out="$STATE/work/issue-$1-plan-prompt.md" wt
+  wt="$(pool_acquire "$n")"
+  pool_prepare "$n" base
+  rvars_for "$n"
+  RENDER_FLAGS="$(docs_flag "$n")"
+  render plan.md "$out"
+
+  emit "ACTION: spawn-agent"
+  emit "STAGE: plan"
+  emit "ISSUE: $n"
+  emit "TITLE: $(get "$n" title "")"
+  emit "DESCRIPTION: $(agent_label Planning "$n")"
+  emit "CATEGORY: $(get "$n" category 5) ($(category_name "$(get "$n" category 5)"))"
+  emit "MODEL: opus"
+  emit "SUBAGENT_TYPE: general-purpose"
+  emit "BACKGROUND: true"
+  emit "ISOLATION: none"
+  emit "WORKTREE: $wt"
+  emit "PROMPT_FILE: $out"
+  emit "PROMPT: Follow the instructions in $out exactly. That file is your complete brief."
+  emit ""
+  emit "ANNOUNCE: Starting issue #$n ($(get "$n" title "")) — $(category_name "$(get "$n" category 5)")."
+  emit "THEN: $SELF record spawned plan $n --agent <agent-name-or-id>"
+}
+
+emit_poll_ci() {
+  local n="$1" pr; pr="$(get "$n" pr "")"
+  emit "ACTION: poll-ci"
+  emit "ISSUE: $n"
+  emit "PR: $pr"
+  emit "RUN: $SELF ci $n"
+  emit ""
+  emit "'$SELF ci $n' checks GitHub Actions and records the result itself; it prints"
+  emit "PASS, FAIL, or PENDING. On PENDING, go do other work — do not block on it."
+}
+
+emit_approvals() {
+  local count=0 n
+  emit "ACTION: ask-approval"
+  emit "TOOL: AskUserQuestion"
+  emit ""
+  for n in "$@"; do
+    [ -n "$n" ] || continue
+    count=$((count + 1))
+    [ "$count" -gt 4 ] && break   # AskUserQuestion caps at 4 questions per call
+    local st; st="$(get "$n" status)"
+    emit "--- QUESTION $count ---"
+    if [ "$st" = "awaiting-merge" ]; then
+      emit "ISSUE: $n"
+      emit "PR: $(get "$n" pr)"
+      emit "HEADER: Merge #$(get "$n" pr)"
+      emit "QUESTION: Issue #$n ($(get "$n" title)) was fixed in PR #$(get "$n" pr) ($(get "$n" pr_url)). Review passed, CI green. Merge?"
+      emit "OPTION_A: Yes, merge"
+      emit "OPTION_B: No, changes needed"
+      emit "ON_A: $SELF record approved merge $n"
+      emit "ON_B: $SELF record declined merge $n --feedback-file <write their feedback to a file>"
+    else
+      emit "ISSUE: $n"
+      emit "VERDICT: $(get "$n" verdict)"
+      emit "HEADER: Close #$n"
+      emit "QUESTION: Issue #$n ($(get "$n" title)) was deemed $(get "$n" verdict): $(get "$n" verdict_summary). Close the issue?"
+      emit "OPTION_A: Yes, close"
+      emit "OPTION_B: No, keep it open"
+      emit "DRAFT_COMMENT_FILE: $(idir "$n")/blob/close-comment.md"
+      emit "ON_A: $SELF record approved close $n"
+      emit "ON_B: $SELF record declined close $n --feedback-file <write their feedback to a file>"
+    fi
+    emit ""
+  done
+  emit "Include the PR URL verbatim in merge questions so the diff can be skimmed."
+  emit "Batch all of the above into ONE AskUserQuestion call."
+}
+
+# ---------------------------------------------------------------------------
+# The end-of-loop documentation phase
+#
+# Agents are forbidden from editing agent-guidance files inside an issue PR (they are
+# shared, so every such edit is a conflict waiting for a sibling PR or the maintainer's
+# own branch). They append suggestions to $STATE/docnotes/issue-<N>.md instead, and
+# this phase lands all of them at once, on a branch attached to no issue, after the
+# queue has drained.
+# ---------------------------------------------------------------------------
+
+docnote_files() {
+  [ -d "$STATE/docnotes" ] || return 0
+  local f
+  for f in "$STATE/docnotes"/issue-*.md; do
+    [ -s "$f" ] || continue
+    echo "$f"
+  done
+  return 0
+}
+
+docnotes_pending() { [ -n "$(docnote_files)" ]; }
+
+# One file the docs agent can read start to finish, with each note stamped with what
+# actually happened to the issue that produced it — a suggestion from an issue that
+# ended parked or failed usually describes behavior that never landed.
+build_docnote_manifest() { # -> prints the manifest path
+  local out="$STATE/work/docnotes-manifest.md" f n st pr
+  mkdir -p "$STATE/work"
+  : > "$out"
+  for f in $(docnote_files); do
+    n="$(basename "$f" .md)"; n="${n#issue-}"
+    st="$(get "$n" status "unknown")"
+    pr="$(get "$n" pr "-")"
+    {
+      printf '===== note from issue #%s — outcome: %s — PR: %s =====\n' "$n" "$st" "$pr"
+      case "$st" in
+        merged|closed) : ;;
+        *) printf '(This issue did NOT land. Verify against the code before applying anything here.)\n' ;;
+      esac
+      cat "$f"
+      printf '\n'
+    } >> "$out"
+  done
+  printf '%s' "$out"
+}
+
+emit_spawn_docs() {
+  local out="$STATE/work/docs-prompt.md" manifest wt count branch
+  manifest="$(build_docnote_manifest)"
+  count="$(docnote_files | wc -l | tr -d ' ')"
+  branch="agent-docs-$(date -u +%Y%m%d-%H%M%S)"
+
+  # Nothing is in flight at this point (that is the only way we get here), so slot 1 is
+  # free and already carries a warm cache.
+  pool_ensure_slot 1
+  slot_reset 1
+  wt="$(slot_path 1)"
+  git -C "$wt" checkout --detach "origin/$DEFAULT_BRANCH" >/dev/null 2>&1 \
+    || die "docs phase: could not detach slot 1 at origin/$DEFAULT_BRANCH"
+
+  RENDER_FLAGS=""
+  RVARS=()
+  rset REPO "$REPO"
+  rset DEFAULT_BRANCH "$DEFAULT_BRANCH"
+  rset DEFERRED_DOCS "$(printf '%s' "$DEFERRED_DOCS" | sed 's/  */, /g')"
+  rset WORKTREE "$wt"
+  rset BRANCH "$branch"
+  rset MANIFEST_FILE "$manifest"
+  rset NOTE_COUNT "$count"
+  render docs.md "$out"
+
+  printf '%s' "$branch" > "$STATE/meta/docs_branch"
+
+  emit "ACTION: spawn-agent"
+  emit "STAGE: docs"
+  emit "DESCRIPTION: Landing deferred doc updates ($count note$([ "$count" = 1 ] || echo s))"
+  emit "MODEL: sonnet"
+  emit "SUBAGENT_TYPE: general-purpose"
+  emit "BACKGROUND: true"
+  emit "ISOLATION: none"
+  emit "WORKTREE: $wt"
+  emit "PROMPT_FILE: $out"
+  emit "PROMPT: Follow the instructions in $out exactly. That file is your complete brief."
+  emit ""
+  emit "ANNOUNCE: Queue drained — landing the $count deferred agent-doc update(s) in one PR."
+  emit "THEN: $SELF record spawned docs --agent <agent-name-or-id>"
+}
+
+emit_docs_approval() {
+  local pr url
+  pr="$(cat "$STATE/meta/docs_pr" 2>/dev/null || true)"
+  url="$(cat "$STATE/meta/docs_pr_url" 2>/dev/null || true)"
+  emit "ACTION: ask-approval"
+  emit "TOOL: AskUserQuestion"
+  emit ""
+  emit "--- QUESTION 1 ---"
+  emit "PR: $pr"
+  emit "HEADER: Merge #$pr"
+  emit "QUESTION: PR #$pr ($url) collects every agent-guidance doc update deferred during this run. It fixes no issue. Merge it?"
+  emit "OPTION_A: Yes, merge"
+  emit "OPTION_B: No, leave it open"
+  emit "ON_A: $SELF record approved docs"
+  emit "ON_B: $SELF record declined docs"
+  emit ""
+  emit "Include the PR URL verbatim so the diff can be skimmed. This is the last action"
+  emit "of the run; '$SELF next' returns ACTION: done afterwards."
+}
+
+# ---------------------------------------------------------------------------
+# ci — poll GitHub Actions for one issue's PR and record the outcome
+# ---------------------------------------------------------------------------
+
+cmd_ci() {
+  require_state
+  local n="$1" pr buckets fail pend
+  pr="$(get "$n" pr "")"
+  [ -n "$pr" ] || die "issue $n has no PR recorded"
+
+  buckets="$(gh pr checks "$pr" --json bucket --jq '.[].bucket' 2>/dev/null || true)"
+
+  if [ -z "$buckets" ]; then
+    # No checks at all. On a fork with Actions never enabled this is the signature
+    # described in the skill's gotchas; it is never silently treated as green.
+    emit "RESULT: NONE"
+    emit "ISSUE: $n"
+    emit "PR: $pr"
+    emit ""
+    emit "No checks reported for PR #$pr. Do NOT treat this as green. Check whether the"
+    emit "repo has Actions enabled (forks default to disabled: 'gh run list' is empty"
+    emit "repo-wide). Tell the user and get an explicit decision before merging."
+    return 0
+  fi
+
+  fail="$(printf '%s\n' "$buckets" | grep -cx 'fail' || true)"
+  pend="$(printf '%s\n' "$buckets" | grep -cx 'pending' || true)"
+
+  if [ "$fail" -gt 0 ]; then
+    local logf; logf="$(idir "$n")/blob/ci-failure.md"
+    {
+      echo "# Failing checks on PR #$pr"
+      echo
+      gh pr checks "$pr" --json name,bucket,state,link \
+        --jq '.[] | select(.bucket=="fail") | "- \(.name) [\(.state)] \(.link)"' 2>/dev/null || true
+    } > "$logf"
+    set_status "$n" implementing "CI failed"
+    queue_fix "$n" CI_FAILURE "CI failed on PR #$pr" "$logf"
+    emit "RESULT: FAIL"
+    emit "ISSUE: $n"
+    emit "PR: $pr"
+    emit "Recorded. Run '$SELF next' — it will hand you the fix spawn."
+    return 0
+  fi
+
+  if [ "$pend" -gt 0 ]; then
+    emit "RESULT: PENDING"
+    emit "ISSUE: $n"
+    emit "PR: $pr"
+    emit "$pend check(s) still running. Go do other work; re-run '$SELF ci $n' later."
+    return 0
+  fi
+
+  set_status "$n" awaiting-merge "review approved and CI green"
+  emit "RESULT: PASS"
+  emit "ISSUE: $n"
+  emit "PR: $pr"
+  emit "Issue #$n is now awaiting-merge. Run '$SELF next'."
+}
+
+# ---------------------------------------------------------------------------
+# record — every state transition
+# ---------------------------------------------------------------------------
+
+cmd_record() {
+  require_state
+  assert_root_clean
+  local event="${1:-}"; shift || true
+  case "$event" in
+    classified)     rec_classified "$@" ;;
+    spawned)        rec_spawned "$@" ;;
+    rebased)        rec_rebased "$@" ;;
+    triaged-conflicts) rec_triaged_conflicts "$@" ;;
+    unhold)         rec_unhold "$@" ;;
+    docs-done)      rec_docs_done "$@" ;;
+    docs-none)      rec_docs_none "$@" ;;
+    plan-done)      rec_plan_done "$@" ;;
+    impl-done)      rec_impl_done "$@" ;;
+    impl-fixed)     rec_impl_fixed "$@" ;;
+    impl-failed)    rec_impl_failed "$@" ;;
+    review-done)    rec_review_done "$@" ;;
+    approved)       rec_approved "$@" ;;
+    declined)       rec_declined "$@" ;;
+    notified)       rec_notified "$@" ;;
+    park)           rec_park "$@" ;;
+    skip)           rec_skip "$@" ;;
+    *) die "record: unknown event '${event:-}'" ;;
+  esac
+}
+
+# --from-file: lines of "<issue>: <category 1-5>[: <short summary>]"
+# The summary is optional on the wire so an older or sloppy classifier result still
+# parses; issue_slug falls back to the title when it is absent.
+rec_classified() {
+  local file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --from-file) file="$2"; shift 2 ;; *) die "record classified: unknown flag $1" ;; esac
+  done
+  [ -f "$file" ] || die "record classified: missing --from-file"
+
+  local n c slug applied=0 clustered=0 key members m
+  while read -r line; do
+    # Only a whole-line comment — a summary may legitimately contain a '#'.
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+
+    # `CLUSTER: <key> <issue> <issue> ...` — issues the classifier expects to edit the
+    # same files. The ranker will not start two of them at once; serializing them is
+    # far cheaper than the rebase / re-review / re-plan churn they cause each other.
+    if [[ "$line" =~ ^[[:space:]]*CLUSTER:[[:space:]]*([A-Za-z0-9_.-]+)[[:space:]]+(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"; members="${BASH_REMATCH[2]}"
+      for m in $members; do
+        m="${m#\#}"; m="${m%,}"
+        [[ "$m" =~ ^[0-9]+$ ]] || continue
+        [ -d "$(idir "$m")" ] || continue
+        [ -n "$(get "$m" cluster "")" ] && continue   # first key wins
+        put "$m" cluster "$key"
+        note "$m" "cluster: $key"
+        clustered=$((clustered + 1))
+      done
+      continue
+    fi
+
+    [[ "$line" =~ ^[[:space:]]*([0-9]+)[[:space:]]*:[[:space:]]*([1-5])[[:space:]]*([:-][[:space:]]*(.*))?$ ]] || continue
+    n="${BASH_REMATCH[1]}"; c="${BASH_REMATCH[2]}"; slug="${BASH_REMATCH[4]}"
+    [ -d "$(idir "$n")" ] || continue
+    [ "$(get "$n" status)" = "queued" ] || continue
+    put "$n" category "$c"
+    put "$n" category_src classify
+    slug="${slug%"${slug##*[![:space:]]}"}"      # trim trailing space
+    [ -n "$slug" ] && put "$n" slug "$slug"
+    set_status "$n" classified "classified as category $c ($(category_name "$c"))${slug:+ — $slug}"
+    applied=$((applied + 1))
+  done < "$file"
+
+  # Anything the classifier skipped defaults to the least-urgent category rather
+  # than jamming the queue.
+  for n in $(issues_with_status queued); do
+    put "$n" category 5
+    put "$n" category_src default
+    set_status "$n" classified "classifier returned no category; defaulted to 5"
+  done
+
+  emit "CLASSIFIED: $applied issue(s)"
+  [ "$clustered" -gt 0 ] && emit "CLUSTERED: $clustered issue(s) grouped; cluster-mates never run concurrently"
+  emit "QUEUE: $(eligible_sorted | tr '\n' ' ')"
+  emit "NEXT: $SELF next"
+}
+
+rec_spawned() { # record spawned <stage> [<issue>] --agent <name>
+  local stage="$1"; shift
+  # The docs and conflict-triage stages belong to the run, not to one issue.
+  if [ "$stage" = docs ] || [ "$stage" = conflict-triage ]; then
+    local a="" owner=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --agent) a="$2"; shift 2 ;; *) owner="$1"; shift ;; esac
+    done
+    # The triage block is parked under the merged issue's dir; clear it or `next`
+    # hands out the same spawn again.
+    [ -n "$owner" ] && [ -d "$(idir "$owner")" ] && clear_pending "$owner"
+    if [ "$stage" = docs ]; then
+      printf '%s' spawned > "$STATE/meta/docs_phase"
+      printf '%s' "$a" > "$STATE/meta/docs_agent"
+      note_global "docs phase: agent $a spawned"
+      emit "OK: documentation agent running."
+    else
+      note_global "conflict triage: agent $a spawned"
+      emit "OK: conflict triage running."
+    fi
+    emit "NEXT: $SELF next"
+    return 0
+  fi
+
+  local n="$1"; shift
+  local agent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --agent) agent="$2"; shift 2 ;; *) die "record spawned: unknown flag $1" ;; esac
+  done
+  clear_pending "$n"
+  put "$n" agent_active "$agent"
+  case "$stage" in
+    plan|replan) set_status "$n" planning "$stage agent $agent" ;;
+    implement|fix) set_status "$n" implementing "$stage agent $agent"
+                   put "$n" agent_impl "$agent" ;;
+    review)      set_status "$n" in-review "reviewer $agent (round $(( $(get "$n" rounds 0) + 1 )))" ;;
+    *) die "record spawned: unknown stage $stage" ;;
+  esac
+  emit "OK: issue $n -> $(get "$n" status)"
+  emit "NEXT: $SELF next"
+}
+
+rec_plan_done() { # record plan-done <issue> --verdict V [--plan-file f] [--comment-file f] [--writeup-file f] [--category C] [--summary S]
+  local n="$1"; shift
+  local verdict="" plan="" comment="" writeup="" cat="" summary="" exempt=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verdict) verdict="$2"; shift 2 ;;
+      --plan-file) plan="$2"; shift 2 ;;
+      --comment-file) comment="$2"; shift 2 ;;
+      --writeup-file) writeup="$2"; shift 2 ;;
+      --category) cat="$2"; shift 2 ;;
+      --summary) summary="$2"; shift 2 ;;
+      --docs-exempt) exempt=1; shift ;;
+      *) die "record plan-done: unknown flag $1" ;;
+    esac
+  done
+  clear_pending "$n"
+  put "$n" agent_active ""
+
+  # The planner said this issue's subject *is* an agent-guidance file, so the deferral
+  # rule does not apply to it — otherwise the issue could never be resolved.
+  if [ -n "$exempt" ]; then
+    put "$n" docs_exempt 1
+    note "$n" "docs_exempt: the issue's subject is an agent-guidance file"
+    emit "DOCS_EXEMPT: issue $n may edit $DEFERRED_DOCS in its own PR"
+  fi
+
+  # The planner investigated the code; the classifier only skimmed the title. When
+  # they disagree the planner wins, and that is what tiers the reviewer.
+  if [ -n "$cat" ]; then
+    local old; old="$(get "$n" category 5)"
+    if [ "$cat" != "$old" ]; then
+      note "$n" "category override by planner: $old -> $cat"
+      emit "CATEGORY_OVERRIDE: $old -> $cat ($(category_name "$cat")) — reviewer tier follows this"
+    fi
+    put "$n" category "$cat"
+    put "$n" category_src plan
+  fi
+
+  case "$verdict" in
+    VALID)
+      [ -f "$plan" ] || die "record plan-done VALID: --plan-file is required"
+      cp "$plan" "$(idir "$n")/blob/plan.md"
+      set_status "$n" planned "plan accepted"
+      local out="$STATE/work/issue-$n-implement-prompt.md"
+      pool_acquire "$n" >/dev/null
+      pool_prepare "$n" base
+      rvars_for "$n"; RENDER_FLAGS="$(docs_flag "$n")"
+      render implement.md "$out"
+      queue_pending "$n" <<EOF
+ACTION: spawn-agent
+STAGE: implement
+ISSUE: $n
+DESCRIPTION: $(agent_label Implementing "$n")
+MODEL: sonnet
+SUBAGENT_TYPE: general-purpose
+BACKGROUND: true
+ISOLATION: none
+WORKTREE: ${RVARS[WORKTREE]}
+PROMPT_FILE: $out
+PROMPT: Follow the instructions in $out exactly. That file is your complete brief.
+
+THEN: $SELF record spawned implement $n --agent <agent-name-or-id>
+EOF
+      emit "OK: issue $n -> planned. Run '$SELF next' for the implementation spawn."
+      ;;
+    INVALID|ALREADY-FIXED|WONT-FIX)
+      [ -f "$comment" ] || die "record plan-done $verdict: --comment-file is required"
+      cp "$comment" "$(idir "$n")/blob/close-comment.md"
+      put "$n" verdict "$verdict"
+      put "$n" verdict_summary "${summary:-see draft comment}"
+      set_status "$n" awaiting-close "$verdict"
+      emit "OK: issue $n -> awaiting-close ($verdict). Nothing posted to GitHub yet."
+      ;;
+    NEEDS-HUMAN)
+      [ -f "$writeup" ] || die "record plan-done NEEDS-HUMAN: --writeup-file is required"
+      cp "$writeup" "$(idir "$n")/blob/needs-human.md"
+      # This is a notification, not an approval gate: post it and move on.
+      gh label create needs-human \
+        --description "Automated triage needs a maintainer decision" \
+        --color D93F0B >/dev/null 2>&1 || true
+      gh issue edit "$n" --add-label needs-human >/dev/null
+      gh issue comment "$n" --body-file "$(idir "$n")/blob/needs-human.md" >/dev/null
+      set_status "$n" parked "needs a maintainer decision"
+      pool_release "$n"
+      emit "OK: issue $n -> parked."
+      emit "POSTED: needs-human label + planner write-up comment on issue #$n"
+      emit "TELL_USER: Issue #$n is parked pending your decision — the planner's research and"
+      emit "TELL_USER: options are posted as a comment on the issue. Continuing with other work."
+      emit "NEXT: $SELF next"
+      ;;
+    *) die "record plan-done: --verdict must be VALID|INVALID|ALREADY-FIXED|WONT-FIX|NEEDS-HUMAN" ;;
+  esac
+}
+
+# A prompt instruction is not enforcement. If a branch carries agent-guidance files
+# anyway, bounce it into a cheap cleanup before it reaches a reviewer — those files
+# conflict with every sibling PR and with the maintainer's own branches, and clearing
+# such a conflict later costs a stopped reviewer plus a restarted implementer.
+# Returns 0 when it queued a cleanup (the caller should stop), 1 when the branch is fine.
+docs_guard() { # docs_guard <issue>
+  local n="$1" strays df tries
+  strays="$(deferred_docs_touched "$n")"
+  [ -n "$strays" ] || return 1
+  tries="$(get "$n" docs_cleanups 0)"
+  if [ "$tries" -ge 1 ]; then
+    # One cleanup round already failed; do not ping-pong. The reviewer treats these
+    # files as a blocking finding, so the normal round-and-park machinery takes over.
+    emit "DEFERRED_DOCS: PR #$(get "$n" pr) still touches $(printf '%s' "$strays" | tr '\n' ' ') after a cleanup round — continuing to review, which treats it as blocking."
+    return 1
+  fi
+  put "$n" docs_cleanups "$((tries + 1))"
+  df="$(idir "$n")/blob/deferred-docs.md"
+  {
+    echo "# Agent-guidance files must not be in this PR"
+    echo
+    echo "This branch changes these deferred files:"
+    echo
+    printf '%s\n' "$strays" | sed 's/^/- `/; s/$/`/'
+  } > "$df"
+  set_status "$n" implementing "branch touches deferred agent-guidance files"
+  queue_fix "$n" DEFERRED_DOCS "the PR edits deferred agent-guidance files" "$df"
+  emit "DEFERRED_DOCS: PR #$(get "$n" pr) touches $(printf '%s' "$strays" | tr '\n' ' ')"
+  emit "OK: issue $n -> implementing (doc cleanup before review). Run '$SELF next'."
+  return 0
+}
+
+rec_impl_done() { # record impl-done <issue> --pr N [--url U] [--branch B]
+  local n="$1"; shift
+  local pr="" url="" branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr) pr="$2"; shift 2 ;;
+      --url) url="$2"; shift 2 ;;
+      --branch) branch="$2"; shift 2 ;;
+      *) die "record impl-done: unknown flag $1" ;;
+    esac
+  done
+  [ -n "$pr" ] || die "record impl-done: --pr is required"
+  clear_pending "$n"
+  put "$n" pr "$pr"
+  [ -n "$url" ] || url="$(gh pr view "$pr" --json url --jq .url 2>/dev/null || true)"
+  put "$n" pr_url "$url"
+  [ -n "$branch" ] && put "$n" branch "$branch"
+
+  if docs_guard "$n"; then return 0; fi
+
+  set_status "$n" in-review "PR #$pr opened"
+  queue_review "$n"
+  emit "OK: issue $n -> in-review (PR #$pr). Run '$SELF next' for the review spawn."
+}
+
+rec_impl_fixed() { # implementer pushed a fix after review findings or CI failure
+  local n="$1"
+  clear_pending "$n"
+  if docs_guard "$n"; then return 0; fi
+  set_status "$n" in-review "implementer pushed a fix"
+  queue_review "$n"
+  emit "OK: issue $n -> in-review. Run '$SELF next' for a fresh reviewer."
+}
+
+rec_impl_failed() {
+  local n="$1"; shift
+  local notef=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --note-file) notef="$2"; shift 2 ;; *) die "record impl-failed: unknown flag $1" ;; esac
+  done
+  [ -n "$notef" ] && [ -f "$notef" ] && cp "$notef" "$(idir "$n")/blob/impl-failure.md"
+  clear_pending "$n"
+  set_status "$n" failed "implementer reported an unresolvable blocker"
+  pool_release "$n"
+  emit "OK: issue $n -> failed. Nothing will be merged for it."
+  emit "TELL_USER: Issue #$n could not be implemented; details in $(idir "$n")/blob/impl-failure.md"
+  resume_blocked_on "$n"
+  emit "NEXT: $SELF next"
+}
+
+# Queue a *fresh* reviewer. Reviewer tier is derived from the (possibly
+# planner-corrected) category, and the prompt template is the only thing that ever
+# reaches the reviewer — which is what actually enforces the clean-context rule.
+queue_review() {
+  local n="$1" cat model out
+  cat="$(get "$n" category 5)"
+  model="$(review_tier_model "$cat")"
+  out="$STATE/work/issue-$n-review-prompt.md"
+  # The slot already carries the implementer's warm build cache, which is what makes
+  # the per-file revert check affordable — each revert is an incremental rebuild.
+  pool_acquire "$n" >/dev/null
+  pool_prepare "$n" branch
+  rvars_for "$n"
+  RENDER_FLAGS="$(docs_flag "$n")"
+  review_is_executing "$cat" && RENDER_FLAGS="EXECUTING $RENDER_FLAGS"
+  render review.md "$out"
+
+  queue_pending "$n" <<EOF
+ACTION: spawn-agent
+STAGE: review
+ISSUE: $n
+PR: $(get "$n" pr)
+DESCRIPTION: $(agent_label Reviewing "$n")
+CATEGORY: $cat ($(category_name "$cat")) -> $( review_is_executing "$cat" && echo "executing review" || echo "diff-reading review")
+MODEL: $model
+SUBAGENT_TYPE: general-purpose
+BACKGROUND: true
+ISOLATION: none
+WORKTREE: ${RVARS[WORKTREE]}
+PROMPT_FILE: $out
+PROMPT: Follow the instructions in $out exactly. That file is your complete brief.
+
+CLEAN CONTEXT: pass the prompt file path and nothing else. Do not add the plan, the
+implementation summary, or any of the implementer's reasoning to this agent's prompt.
+
+THEN: $SELF record spawned review $n --agent <agent-name-or-id>
+EOF
+}
+
+# Spawn a *fresh* agent to fix an existing branch, rather than messaging a live one.
+# By this point the implementer has always completed (review and CI both run after it
+# reports), so there is no live context to preserve — and the branch, commits, and warm
+# build cache all live in the slot, which is the state that actually matters. This is
+# also what makes the loop restart-safe: nothing depends on an agent surviving.
+queue_fix() { # queue_fix <issue> <FLAG> <reason> <body-file>
+  local n="$1" flag="$2" reason="$3" body="$4"
+  local out="$STATE/work/issue-$n-fix-prompt.md"
+  pool_acquire "$n" >/dev/null
+  pool_prepare "$n" branch
+  rvars_for "$n"
+  rset REASON "$reason"
+  rset BODY_FILE "$body"
+  RENDER_FLAGS="$flag $(docs_flag "$n")"
+  render fix.md "$out"
+  queue_pending "$n" <<EOF
+ACTION: spawn-agent
+STAGE: fix
+ISSUE: $n
+PR: $(get "$n" pr)
+REASON: $reason
+DESCRIPTION: $(agent_label Fixing "$n")
+MODEL: sonnet
+SUBAGENT_TYPE: general-purpose
+BACKGROUND: true
+ISOLATION: none
+WORKTREE: ${RVARS[WORKTREE]}
+PROMPT_FILE: $out
+PROMPT: Follow the instructions in $out exactly. That file is your complete brief.
+${5:+STOP_AGENT: $5}
+
+THEN: $SELF record spawned fix $n --agent <agent-name-or-id>
+EOF
+}
+
+rec_review_done() { # record review-done <issue> --verdict APPROVE|REQUEST-CHANGES [--findings-file f]
+  local n="$1"; shift
+  local verdict="" findings=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --verdict) verdict="$2"; shift 2 ;;
+      --findings-file) findings="$2"; shift 2 ;;
+      *) die "record review-done: unknown flag $1" ;;
+    esac
+  done
+  clear_pending "$n"
+  put "$n" agent_active ""
+
+  case "$verdict" in
+    APPROVE)
+      # A merge that shared no files with this branch deferred its rebase to here,
+      # where the slot is idle — rebasing under a running reviewer is what the deferral
+      # avoids, and doing it now keeps the branch current without voiding the verdict.
+      if [ "$(get "$n" needs_rebase 0)" = 1 ]; then
+        put "$n" needs_rebase 0
+        local rrc=0; pool_rebase "$n" || rrc=$?
+        if [ "$rrc" = 1 ]; then
+          local rcf="$(idir "$n")/blob/rebase-conflict.md"
+          {
+            echo "# Rebase conflict on an approved branch"
+            echo
+            echo "Sibling PRs merged to \`$DEFAULT_BRANCH\` while this change was in review. They"
+            echo "touched no file this branch touches, so the review stood — but rebasing"
+            echo "\`$(get "$n" branch)\` onto \`origin/$DEFAULT_BRANCH\` still conflicts. The rebase"
+            echo "was aborted."
+          } > "$rcf"
+          set_status "$n" implementing "approved, but conflicts with $DEFAULT_BRANCH"
+          queue_fix "$n" REBASE_CONFLICT "the approved branch conflicts with $DEFAULT_BRANCH" "$rcf"
+          emit "OK: issue $n approved but conflicts with $DEFAULT_BRANCH; queued a fix. Run '$SELF next'."
+          return 0
+        fi
+        [ "$rrc" = 0 ] && emit "REBASED: issue $n brought up to date with $DEFAULT_BRANCH before CI (verdict kept)"
+      fi
+      set_status "$n" ci-pending "review approved"
+      emit "OK: issue $n -> ci-pending. Merge is gated on CI; run '$SELF ci $n'."
+      emit "NEXT: $SELF next"
+      ;;
+    REQUEST-CHANGES|REQUEST_CHANGES)
+      local rounds; rounds=$(( $(get "$n" rounds 0) + 1 ))
+      put "$n" rounds "$rounds"
+      local dest="$(idir "$n")/blob/findings-$rounds.md"
+      [ -f "$findings" ] || die "record review-done REQUEST-CHANGES: --findings-file is required"
+      cp "$findings" "$dest"
+
+      if [ "$rounds" -ge "$MAX_ROUNDS" ]; then
+        set_status "$n" parked "$rounds rejected review rounds"
+        pool_release "$n"
+        emit "OK: issue $n -> parked after $rounds rejected review round(s) (limit $MAX_ROUNDS)."
+        emit "TELL_USER: Issue #$n (PR #$(get "$n" pr)) has been through $rounds review rounds without"
+        emit "TELL_USER: converging. Summarize both sides for the user — the review findings are in"
+        emit "TELL_USER: $(idir "$n")/blob/findings-*.md — and move on to other work."
+        emit "NEXT: $SELF next"
+        return 0
+      fi
+
+      set_status "$n" implementing "review round $rounds requested changes"
+      queue_fix "$n" REVIEW_FINDINGS "review round $rounds requested changes" "$dest"
+      emit "OK: issue $n -> implementing (round $rounds of $MAX_ROUNDS). Run '$SELF next' for the fix spawn."
+      ;;
+    *) die "record review-done: --verdict must be APPROVE or REQUEST-CHANGES" ;;
+  esac
+}
+
+rec_approved() { # record approved merge|close <issue>  |  record approved docs
+  local kind="$1" n="${2:-}"
+  case "$kind" in
+    docs)
+      do_merge_docs
+      return 0
+      ;;
+    close)
+      gh issue comment "$n" --body-file "$(idir "$n")/blob/close-comment.md" >/dev/null
+      local reason="not planned"
+      [ "$(get "$n" verdict)" = "ALREADY-FIXED" ] && reason="completed"
+      gh issue close "$n" --reason "$reason" >/dev/null
+      set_status "$n" closed "closed as $(get "$n" verdict)"
+      pool_release "$n"
+      emit "CLOSED: issue #$n ($(get "$n" verdict), reason=$reason)"
+      resume_blocked_on "$n"
+      emit "NEXT: $SELF next"
+      ;;
+    merge)
+      do_merge "$n"
+      ;;
+    *) die "record approved: expected 'merge' or 'close'" ;;
+  esac
+}
+
+rec_declined() { # record declined merge|close <issue> --feedback-file f  |  record declined docs
+  local kind="$1"
+  # The docs PR is not attached to an issue and has no fix loop: declining just leaves
+  # it open for the maintainer to edit or close by hand.
+  if [ "$kind" = docs ]; then
+    printf '%s' left-open > "$STATE/meta/docs_phase"
+    note_global "docs PR #$(cat "$STATE/meta/docs_pr" 2>/dev/null) declined; left open"
+    emit "OK: docs PR left open."
+    emit "TELL_USER: PR #$(cat "$STATE/meta/docs_pr" 2>/dev/null) with the deferred doc updates is still open at $(cat "$STATE/meta/docs_pr_url" 2>/dev/null) — edit or close it at your leisure."
+    emit "NEXT: $SELF next"
+    return 0
+  fi
+  local n="$2"; shift 2
+  local fb=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --feedback-file) fb="$2"; shift 2 ;; *) die "record declined: unknown flag $1" ;; esac
+  done
+  [ -f "$fb" ] || die "record declined: --feedback-file is required (write the user's feedback to a file)"
+
+  case "$kind" in
+    close)
+      # The maintainer disagrees with the triage verdict; re-plan with their input.
+      cp "$fb" "$(idir "$n")/blob/user-feedback.md"
+      queue_replan "$n" "" declined-close
+      emit "OK: issue $n -> re-triage queued. Run '$SELF next'."
+      ;;
+    merge)
+      cp "$fb" "$(idir "$n")/blob/user-feedback.md"
+      set_status "$n" implementing "merge declined; maintainer requested changes"
+      queue_fix "$n" USER_FEEDBACK "the maintainer declined the merge" "$(idir "$n")/blob/user-feedback.md"
+      emit "OK: issue $n -> implementing. Run '$SELF next' for the fix spawn."
+      ;;
+    *) die "record declined: expected 'merge' or 'close'" ;;
+  esac
+}
+
+rec_notified() { clear_pending "$1"; emit "OK: pending action for issue $1 cleared."; emit "NEXT: $SELF next"; }
+
+rec_docs_done() { # record docs-done --pr N [--url U]
+  local pr="" url=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pr) pr="$2"; shift 2 ;;
+      --url) url="$2"; shift 2 ;;
+      *) die "record docs-done: unknown flag $1" ;;
+    esac
+  done
+  [ -n "$pr" ] || die "record docs-done: --pr is required (use docs-none if it opened no PR)"
+  [ -n "$url" ] || url="$(gh pr view "$pr" --json url --jq .url 2>/dev/null || true)"
+  printf '%s' "$pr"  > "$STATE/meta/docs_pr"
+  printf '%s' "$url" > "$STATE/meta/docs_pr_url"
+  printf '%s' awaiting-merge > "$STATE/meta/docs_phase"
+  note_global "docs PR #$pr opened"
+  emit "OK: docs PR #$pr open and awaiting your approval. Run '$SELF next'."
+}
+
+rec_docs_none() { # record docs-none [--reason "..."]
+  local reason="nothing worth landing"
+  while [ $# -gt 0 ]; do
+    case "$1" in --reason) reason="$2"; shift 2 ;; *) die "record docs-none: unknown flag $1" ;; esac
+  done
+  printf '%s' skipped > "$STATE/meta/docs_phase"
+  printf '%s' "$reason" > "$STATE/meta/docs_reason"
+  archive_docnotes
+  note_global "docs phase skipped: $reason"
+  emit "OK: no documentation PR ($reason). Run '$SELF next'."
+}
+
+# Notes that have been through the docs agent are moved aside, so a later `init` +
+# resumed run does not re-propose them.
+archive_docnotes() {
+  local f
+  mkdir -p "$STATE/docnotes/applied"
+  for f in $(docnote_files); do
+    mv "$f" "$STATE/docnotes/applied/$(basename "$f")" 2>/dev/null || true
+  done
+  return 0
+}
+
+# A fix agent resolved a rebase conflict in its slot and pushed. Same destination as
+# any other fix: back through a fresh review.
+rec_rebased() { rec_impl_fixed "$@"; }
+
+rec_park() {
+  local n="$1"; shift
+  local reason="parked by orchestrator"
+  while [ $# -gt 0 ]; do
+    case "$1" in --reason) reason="$2"; shift 2 ;; *) die "record park: unknown flag $1" ;; esac
+  done
+  clear_pending "$n"; set_status "$n" parked "$reason"; pool_release "$n"
+  emit "OK: issue $n -> parked ($reason)"
+  resume_blocked_on "$n"
+  emit "NEXT: $SELF next"
+}
+
+rec_skip() {
+  local n="$1"; shift
+  local reason="skipped by orchestrator"
+  while [ $# -gt 0 ]; do
+    case "$1" in --reason) reason="$2"; shift 2 ;; *) die "record skip: unknown flag $1" ;; esac
+  done
+  clear_pending "$n"; set_status "$n" skipped "$reason"; pool_release "$n"
+  emit "OK: issue $n -> skipped ($reason)"
+  resume_blocked_on "$n"
+  emit "NEXT: $SELF next"
+}
+
+# ---------------------------------------------------------------------------
+# Merge + post-merge fanout
+# ---------------------------------------------------------------------------
+
+do_merge() {
+  local n="$1" pr; pr="$(get "$n" pr)"
+
+  # `gh pr review --approve` fails on your own PRs, so the approval record is a comment.
+  local sumf="$(idir "$n")/blob/merge-approval.md"
+  {
+    echo "Approved and merged via the automated issue loop."
+    echo
+    echo "- Independent review: passed (round $(get "$n" rounds 0) of $MAX_ROUNDS)."
+    echo "- GitHub Actions: green."
+    echo "- Maintainer approval: granted."
+  } > "$sumf"
+  gh pr comment "$pr" --body-file "$sumf" >/dev/null || true
+
+  # --delete-branch exits non-zero when a leftover agent worktree still references
+  # the local branch, even though the merge and remote deletion both succeeded.
+  # Authoritative check is the PR state, not the exit code.
+  gh pr merge "$pr" --squash --delete-branch >/dev/null 2>&1 || true
+
+  local state; state="$(gh pr view "$pr" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
+  if [ "$state" != "MERGED" ]; then
+    emit "MERGE_FAILED: PR #$pr is in state $state, not MERGED."
+    emit "Investigate with 'gh pr view $pr'. Issue $n left at $(get "$n" status)."
+    return 1
+  fi
+
+  set_status "$n" merged "PR #$pr squash-merged"
+  pool_release "$n"
+
+  # `Fixes #N` should have auto-closed it; verify rather than assume.
+  local istate; istate="$(gh issue view "$n" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
+  if [ "$istate" != "CLOSED" ]; then
+    gh issue close "$n" --reason completed >/dev/null 2>&1 || true
+    emit "NOTE: issue #$n did not auto-close from the PR body; closed it manually."
+  fi
+
+  emit "MERGED: PR #$pr (issue #$n)"
+  post_merge_fanout "$n" "$pr"
+}
+
+# The end-of-loop documentation PR. It fixes no issue, went through no review round, and
+# has no siblings to fan out to, so this is deliberately not do_merge().
+do_merge_docs() {
+  local pr state; pr="$(cat "$STATE/meta/docs_pr" 2>/dev/null || true)"
+  [ -n "$pr" ] || die "record approved docs: no docs PR recorded"
+  gh pr merge "$pr" --squash --delete-branch >/dev/null 2>&1 || true
+  state="$(gh pr view "$pr" --json state --jq .state 2>/dev/null || echo UNKNOWN)"
+  if [ "$state" != "MERGED" ]; then
+    emit "MERGE_FAILED: docs PR #$pr is in state $state, not MERGED."
+    emit "Investigate with 'gh pr view $pr'; the docs phase stays at awaiting-merge."
+    return 1
+  fi
+  printf '%s' done > "$STATE/meta/docs_phase"
+  archive_docnotes
+  git -C "$ROOT" pull --ff-only >/dev/null 2>&1 || true
+  note_global "docs PR #$pr merged"
+  emit "MERGED: docs PR #$pr (deferred agent-guidance updates)"
+  emit "NEXT: $SELF next"
+}
+
+# The mechanical half of the fanout, applied to one sibling once something has decided
+# that the merged change could actually affect it.
+apply_rebase_decision() { # apply_rebase_decision <issue> <merged-issue> <merged-pr>
+  local n="$1" merged_issue="$2" merged_pr="$3" pr prev active rc cf
+  pr="$(get "$n" pr "")"
+  prev="$(get "$n" status)"
+  active="$(get "$n" agent_active "")"
+
+  # A live implementer owns its slot; the script must not rebase underneath it.
+  # Message it instead so it absorbs the change mid-run, which is far cheaper than
+  # discovering the conflict at PR time.
+  if [ "$prev" = "implementing" ]; then
+    queue_pending "$n" <<EOF
+ACTION: send-message
+ISSUE: $n
+TO: ${active:-$(get "$n" agent_impl "<implementation agent>")}
+REASON: sibling merge — $DEFAULT_BRANCH moved while you are working
+MESSAGE: PR #$merged_pr for issue #$merged_issue just merged to $DEFAULT_BRANCH and it touches files your change touches. In your worktree, run 'git fetch origin' and rebase onto origin/$DEFAULT_BRANCH now, before continuing. If the merged change overlaps or invalidates your plan, say so explicitly in your report instead of forcing the plan through.
+THEN: $SELF record notified $n
+EOF
+    return 0
+  fi
+
+  # Otherwise the slot is idle (in-review / ci-pending / awaiting-merge), so the
+  # script rebases it directly. A conflict is git's exit code, not a guess at
+  # GitHub's asynchronously-computed `mergeable` field.
+  rc=0; pool_rebase "$n" || rc=$?
+
+  case "$rc" in
+    0)
+      # Clean rebase, but the changes interact — a prior verdict was formed against
+      # code that moved, so it goes back through a fresh review.
+      set_status "$n" in-review "rebased onto $DEFAULT_BRANCH after PR #$merged_pr merged (was $prev)"
+      queue_review "$n"
+      [ -n "$active" ] && emit "STOP_AGENT: $active (reviewer for issue #$n — its verdict is void after the rebase)"
+      emit "REBASED: issue #$n / PR #$pr rebased cleanly and force-pushed; re-reviewing"
+      ;;
+    1)
+      # Real conflict. Hand it to a fix agent in the same slot, with the merged
+      # change named so it can judge whether the premise still holds.
+      cf="$(idir "$n")/blob/rebase-conflict.md"
+      {
+        echo "# Rebase conflict after PR #$merged_pr merged"
+        echo
+        echo "PR #$merged_pr (issue #$merged_issue) merged to \`$DEFAULT_BRANCH\`, and rebasing"
+        echo "branch \`$(get "$n" branch)\` onto \`origin/$DEFAULT_BRANCH\` conflicts. The rebase was"
+        echo "aborted, so your slot is back on the un-rebased branch."
+        echo
+        echo "Inspect the merged change with \`gh pr view $merged_pr\` and \`gh pr diff $merged_pr\`."
+      } > "$cf"
+      set_status "$n" implementing "rebase conflict after PR #$merged_pr merged (was $prev)"
+      queue_fix "$n" REBASE_CONFLICT "rebase conflict after PR #$merged_pr merged" "$cf" "$active"
+      emit "CONFLICT: issue #$n / PR #$pr conflicts after the merge — review voided, back to implementing"
+      ;;
+    *)
+      : # No slot or no pushed branch yet; nothing to rebase.
+      ;;
+  esac
+  return 0
+}
+
+# Pause a sibling that should not advance while another in-flight issue is entangled
+# with it. It keeps its slot, branch, and warm cache; the loop resumes it — rebased —
+# the moment its blocker reaches a terminal status.
+hold_issue() { # hold_issue <issue> <blocker> <why>
+  local n="$1" blocker="$2" why="$3" active
+  # Re-applying a triage file must not overwrite held_from with `held`.
+  if [ "$(get "$n" status)" = held ]; then
+    emit "HELD: issue #$n already waiting for #$(get "$n" blocked_by)"
+    return 0
+  fi
+  active="$(get "$n" agent_active "")"
+  put "$n" held_from "$(get "$n" status)"
+  put "$n" blocked_by "$blocker"
+  set_status "$n" held "serialized behind #$blocker: $why"
+  put "$n" agent_active ""
+  [ -n "$active" ] && emit "STOP_AGENT: $active (working issue #$n — serialized behind #$blocker, its output would be redone)"
+  emit "HELD: issue #$n waits for #$blocker — $why"
+  return 0
+}
+
+# Whatever a held issue was waiting for has landed. Rebase it and put it back into the
+# pipeline where it left off.
+resume_blocked_on() { # resume_blocked_on <terminal-issue>
+  local blocker="$1" n rc from cf
+  for n in $(issues_with_status held); do
+    [ "$(get "$n" blocked_by "")" = "$blocker" ] || continue
+    from="$(get "$n" held_from in-review)"
+    put "$n" blocked_by ""
+    put "$n" held_from ""
+
+    # Held before a PR existed: the plan was written against code that has since moved,
+    # so re-derive it rather than implement a stale plan.
+    if [ -z "$(get "$n" pr "")" ]; then
+      queue_replan "$n" "$(get "$blocker" pr "")"
+      emit "UNHELD: issue #$n resumes after #$blocker landed — re-planning against current $DEFAULT_BRANCH"
+      continue
+    fi
+
+    rc=0; pool_rebase "$n" || rc=$?
+    if [ "$rc" = 1 ]; then
+      cf="$(idir "$n")/blob/rebase-conflict.md"
+      {
+        echo "# Rebase conflict after issue #$blocker landed"
+        echo
+        echo "This branch was held while issue #$blocker was in flight, precisely because the"
+        echo "two changes were entangled. It has landed, and rebasing \`$(get "$n" branch)\` onto"
+        echo "\`origin/$DEFAULT_BRANCH\` conflicts. The rebase was aborted."
+      } > "$cf"
+      set_status "$n" implementing "unheld; rebase conflicts after #$blocker landed"
+      queue_fix "$n" REBASE_CONFLICT "rebase conflict after issue #$blocker landed" "$cf"
+      emit "UNHELD: issue #$n resumes after #$blocker landed — conflicts, back to implementing"
+    else
+      set_status "$n" in-review "unheld after #$blocker landed (was $from)"
+      queue_review "$n"
+      emit "UNHELD: issue #$n resumes after #$blocker landed — rebased, re-reviewing"
+    fi
+  done
+  return 0
+}
+
+rec_unhold() { # record unhold <issue> — manual escape hatch
+  local n="$1"
+  [ "$(get "$n" status)" = held ] || die "record unhold: issue $n is not held"
+  local blocker; blocker="$(get "$n" blocked_by "")"
+  put "$n" blocked_by "__unhold__"
+  resume_blocked_on "__unhold__"
+  note "$n" "unheld by hand (was waiting on #$blocker)"
+  emit "NEXT: $SELF next"
+}
+
+# main just moved under every sibling still in flight. Work out which siblings the
+# merged change could plausibly have affected before spending anything on them: a
+# sibling that shares no files with it keeps its verdict and is not re-reviewed, and
+# only the ones that do share files are worth a model's judgment.
+post_merge_fanout() {
+  local merged_issue="$1" merged_pr="$2" n mf sf shared touched=0 disjoint=0
+  local -a overlapping=()
+
+  git -C "$ROOT" pull --ff-only >/dev/null 2>&1 \
+    && emit "ROOT: $ROOT fast-forwarded to origin/$DEFAULT_BRANCH" \
+    || emit "ROOT: 'git pull --ff-only' failed in $ROOT — check it is clean and on $DEFAULT_BRANCH"
+
+  # Anything that was deliberately serialized behind this issue goes first.
+  resume_blocked_on "$merged_issue"
+
+  mf="$STATE/work/merged-$merged_pr-files.txt"
+  mkdir -p "$STATE/work"
+  pr_files "$merged_pr" | sort -u > "$mf"
+
+  for n in $(issues_with_status implementing in-review ci-pending awaiting-merge); do
+    [ "$n" = "$merged_issue" ] && continue
+
+    sf="$STATE/work/issue-$n-files.txt"
+    if [ -n "$(get "$n" branch "")" ] || [ -n "$(get "$n" pr "")" ]; then
+      issue_files "$n" | sort -u > "$sf"
+    else
+      planned_files "$n" > "$sf"
+    fi
+
+    # Either side unknown -> assume they interact. A wrong "disjoint" is a bad merge;
+    # a wrong "overlapping" only costs one cheap triage.
+    if [ ! -s "$mf" ] || [ ! -s "$sf" ]; then
+      overlapping+=("$n")
+      continue
+    fi
+
+    shared="$(shared_paths "$mf" "$sf")"
+    if [ -n "$shared" ]; then
+      printf '%s\n' "$shared" > "$STATE/work/issue-$n-shared.txt"
+      overlapping+=("$n")
+    else
+      # Disjoint: the merged change cannot have altered what this PR does or what its
+      # reviewer concluded, so nothing is voided and nothing is respawned. The rebase
+      # is deferred to the next idle moment (review approval) rather than done under a
+      # running agent — GitHub tests and merges the PR against current main regardless.
+      put "$n" needs_rebase 1
+      disjoint=$((disjoint + 1))
+      emit "DISJOINT: issue #$n shares no files with PR #$merged_pr — verdict kept, no re-review, rebase deferred"
+    fi
+  done
+
+  if [ "${#overlapping[@]}" -gt 0 ]; then
+    touched="${#overlapping[@]}"
+    emit "FANOUT: $disjoint sibling(s) unaffected; $touched need a conflict decision"
+    emit_conflict_triage "$merged_issue" "$merged_pr" "${overlapping[@]}"
+    return 0
+  fi
+
+  emit "FANOUT: $disjoint sibling(s) checked, none affected by PR #$merged_pr"
+  emit "NEXT: $SELF next"
+}
+
+# One cheap agent reasons about every sibling that shares files with the merged change,
+# and says — per sibling — whether it is genuinely affected. Deciding this up front is
+# what avoids paying for a fix agent and a review round only to be told the premise
+# changed, and it is where entangled work gets serialized instead of thrashing.
+emit_conflict_triage() { # emit_conflict_triage <merged-issue> <merged-pr> <sibling>...
+  local merged_issue="$1" merged_pr="$2"; shift 2
+  local out="$STATE/work/conflict-triage-prompt.md"
+  local input="$STATE/work/conflict-triage-input.md"
+  local result="$STATE/work/conflict-triage.txt"
+  local n
+
+  : > "$input"
+  for n in "$@"; do
+    {
+      printf '===== sibling issue #%s =====\n' "$n"
+      printf 'TITLE: %s\n' "$(get "$n" title "")"
+      printf 'STATUS: %s\n' "$(get "$n" status)"
+      printf 'PR: %s\n' "$(get "$n" pr "-")"
+      printf 'BRANCH: %s\n' "$(get "$n" branch "-")"
+      printf 'CLUSTER: %s\n' "$(get "$n" cluster "-")"
+      printf 'SHARED FILES with PR #%s:\n' "$merged_pr"
+      if [ -s "$STATE/work/issue-$n-shared.txt" ]; then
+        sed 's/^/  /' "$STATE/work/issue-$n-shared.txt"
+      else
+        printf '  (unknown — this sibling has no pushed branch yet; judge from its plan)\n'
+      fi
+      printf 'ITS PLAN:\n'
+      if [ -f "$(idir "$n")/blob/plan.md" ]; then
+        sed 's/^/  /' "$(idir "$n")/blob/plan.md"
+      else
+        printf '  (no plan on file)\n'
+      fi
+      printf '\n'
+    } >> "$input"
+  done
+
+  printf '%s' "$merged_pr" > "$STATE/meta/last_merged_pr"
+  printf '%s' "$merged_issue" > "$STATE/meta/last_merged_issue"
+
+  RENDER_FLAGS=""
+  RVARS=()
+  rset REPO "$REPO"
+  rset DEFAULT_BRANCH "$DEFAULT_BRANCH"
+  rset MERGED_PR "$merged_pr"
+  rset MERGED_ISSUE "$merged_issue"
+  rset SIBLINGS "$*"
+  rset INPUT_FILE "$input"
+  rset OUT_FILE "$result"
+  render conflict-triage.md "$out"
+  rm -f "$result"
+  printf '%s' "$*" > "$STATE/meta/last_triage_siblings"
+
+  queue_pending "$merged_issue" <<EOF
+ACTION: spawn-agent
+STAGE: conflict-triage
+MERGED_PR: $merged_pr
+SIBLINGS: $*
+DESCRIPTION: Conflict triage after #$merged_pr
+MODEL: sonnet
+SUBAGENT_TYPE: general-purpose
+BACKGROUND: true
+ISOLATION: none
+PROMPT_FILE: $out
+PROMPT: Follow the instructions in $out exactly. That file is your complete brief.
+
+READ-ONLY: this agent inspects diffs and plans. It gets no worktree and must not
+change any file in the repo.
+
+THEN: $SELF record spawned conflict-triage $merged_issue --agent <agent-name-or-id>
+EOF
+  emit "TRIAGE: PR #$merged_pr shares files with issue(s) $* — one agent decides what each one needs."
+  emit "NEXT: $SELF next"
+}
+
+# Apply the triage verdicts. Lines look like:
+#   <issue>: INDEPENDENT|REBASE|REPLAN|SERIALIZE [blocked-by <issue>] — <why>
+rec_triaged_conflicts() { # record triaged-conflicts --from-file f
+  local file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --from-file) file="$2"; shift 2 ;; *) die "record triaged-conflicts: unknown flag $1" ;; esac
+  done
+  [ -f "$file" ] || die "record triaged-conflicts: missing --from-file"
+
+  local merged_pr merged_issue n decision blocker rest line seen=""
+  merged_pr="$(cat "$STATE/meta/last_merged_pr" 2>/dev/null || true)"
+  merged_issue="$(cat "$STATE/meta/last_merged_issue" 2>/dev/null || true)"
+  clear_pending "$merged_issue"
+
+  while read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*#?([0-9]+)[[:space:]]*:[[:space:]]*([A-Za-z-]+)(.*)$ ]] || continue
+    n="${BASH_REMATCH[1]}"; decision="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:lower:]' '[:upper:]')"; rest="${BASH_REMATCH[3]}"
+    [ -d "$(idir "$n")" ] || continue
+    seen="$seen $n"
+    blocker=""
+    [[ "$rest" =~ blocked-by[[:space:]]+#?([0-9]+) ]] && blocker="${BASH_REMATCH[1]}"
+
+    case "$decision" in
+      INDEPENDENT)
+        put "$n" needs_rebase 1
+        note "$n" "conflict triage: independent of PR #$merged_pr; verdict kept"
+        emit "INDEPENDENT: issue #$n shares files with PR #$merged_pr but the changes do not interact — verdict kept, no re-review"
+        ;;
+      SERIALIZE)
+        # Only meaningful against something still in flight; otherwise there is nothing
+        # to wait for and a rebase is the honest answer.
+        if [ -n "$blocker" ] && [ -d "$(idir "$blocker")" ] \
+           && printf '%s\n' $INFLIGHT_STATUSES | grep -qx "$(get "$blocker" status)"; then
+          hold_issue "$n" "$blocker" "entangled with #$blocker after PR #$merged_pr"
+        else
+          emit "NOTE: issue #$n was marked SERIALIZE with no in-flight blocker; rebasing instead."
+          apply_rebase_decision "$n" "$merged_issue" "$merged_pr"
+        fi
+        ;;
+      REPLAN)
+        local active; active="$(get "$n" agent_active "")"
+        [ -n "$active" ] && emit "STOP_AGENT: $active (working issue #$n — its premise changed with PR #$merged_pr)"
+        queue_replan "$n" "$merged_pr"
+        emit "REPLAN: issue #$n — PR #$merged_pr invalidated its premise; re-planning before spending another implementation round"
+        ;;
+      *)
+        apply_rebase_decision "$n" "$merged_issue" "$merged_pr"
+        ;;
+    esac
+  done < "$file"
+
+  # A sibling the triage forgot is not left in limbo: it gets the conservative answer.
+  local expected m
+  expected="$(cat "$STATE/meta/last_triage_siblings" 2>/dev/null || true)"
+  for m in $expected; do
+    case " $seen " in
+      *" $m "*) continue ;;
+    esac
+    emit "NOTE: issue #$m got no triage verdict; rebasing and re-reviewing it."
+    apply_rebase_decision "$m" "$merged_issue" "$merged_pr"
+    seen="$seen $m"
+  done
+
+  emit "TRIAGED:${seen:- none}"
+  emit "NEXT: $SELF next"
+}
+
+# ---------------------------------------------------------------------------
+# replan — premise changed under an in-flight fix
+# ---------------------------------------------------------------------------
+
+queue_replan() { # queue_replan <issue> <merged-pr> [declined-close]
+  local n="$1" merged_pr="${2:-}" mode="${3:-premise}"
+  local out="$STATE/work/issue-$n-replan-prompt.md"
+  # The replanner works in the issue's own slot, like every other stage — it needs the
+  # warm cache to reproduce, and a fresh harness worktree would throw it away.
+  pool_acquire "$n" >/dev/null
+  pool_prepare "$n" base
+  rvars_for "$n"
+  rset MERGED_PR "$merged_pr"
+  if [ "$mode" = declined-close ]; then
+    rset FEEDBACK_FILE "$(idir "$n")/blob/user-feedback.md"
+    rset PRIOR_FILE "$(idir "$n")/blob/close-comment.md"
+    rset PRIOR_LABEL "the draft closing comment it produced"
+    RENDER_FLAGS="FROM_DECLINED_CLOSE $(docs_flag "$n")"
+  else
+    rset PRIOR_FILE "$(idir "$n")/blob/plan.md"
+    rset PRIOR_LABEL "the original plan"
+    RENDER_FLAGS="FROM_PREMISE_CHANGE $(docs_flag "$n")"
+  fi
+  render replan.md "$out"
+  if [ "$mode" = declined-close ]; then
+    set_status "$n" planning "close declined; re-triage with maintainer feedback"
+  else
+    set_status "$n" planning "premise changed by merged PR #$merged_pr"
+  fi
+  queue_pending "$n" <<EOF
+ACTION: spawn-agent
+STAGE: replan
+ISSUE: $n
+DESCRIPTION: $(agent_label Re-planning "$n")
+MODEL: opus
+SUBAGENT_TYPE: general-purpose
+BACKGROUND: true
+ISOLATION: none
+WORKTREE: ${RVARS[WORKTREE]}
+PROMPT_FILE: $out
+PROMPT: Follow the instructions in $out exactly. That file is your complete brief.
+
+THEN: $SELF record spawned replan $n --agent <agent-name-or-id>
+EOF
+  return 0
+}
+
+cmd_replan() {
+  require_state
+  local n="$1"; shift
+  local merged_pr=""
+  while [ $# -gt 0 ]; do
+    case "$1" in --merged-pr) merged_pr="$2"; shift 2 ;; *) die "replan: unknown flag $1" ;; esac
+  done
+  queue_replan "$n" "$merged_pr"
+  emit "OK: issue $n -> re-planning. Run '$SELF next'."
+}
+
+# ---------------------------------------------------------------------------
+# reconcile — rebuild state from GitHub after a crash or a fresh session
+# ---------------------------------------------------------------------------
+
+cmd_reconcile() {
+  require_state
+  local pr head n recovered=0
+  while IFS=$'\t' read -r pr head; do
+    [ -n "$pr" ] || continue
+    # Branch convention is issue-<N>-<slug>; the PR body's Fixes #N is the fallback.
+    n=""
+    [[ "$head" =~ ^issue-([0-9]+)- ]] && n="${BASH_REMATCH[1]}"
+    if [ -z "$n" ]; then
+      n="$(gh pr view "$pr" --json body \
+            --jq '.body | capture("(?i)(fixes|closes|resolves) #(?<n>[0-9]+)").n' 2>/dev/null || true)"
+    fi
+    [ -n "$n" ] || { warn "PR #$pr: cannot map to an issue; skipping"; continue; }
+    mkdir -p "$(idir "$n")/blob"
+    [ -f "$(idir "$n")/title" ] || put "$n" title "$(gh issue view "$n" --json title --jq .title 2>/dev/null || echo "#$n")"
+    [ -f "$(idir "$n")/category" ] || { put "$n" category 3; put "$n" category_src reconcile; }
+    put "$n" pr "$pr"
+    put "$n" pr_url "$(gh pr view "$pr" --json url --jq .url)"
+    put "$n" branch "$head"
+    # No live implementation agent exists after a restart, so an orphaned PR goes
+    # back through review rather than resuming a conversation that is gone.
+    set_status "$n" in-review "recovered from open PR #$pr by reconcile"
+    queue_review "$n"
+    recovered=$((recovered + 1))
+  done < <(gh pr list --state open --json number,headRefName --jq '.[] | [.number, .headRefName] | @tsv')
+
+  emit "RECOVERED: $recovered open PR(s) mapped back to issues"
+  emit "WARNING: implementation agents from the previous session are gone. Recovered"
+  emit "WARNING: issues re-enter review; a REQUEST-CHANGES on one needs a fresh"
+  emit "WARNING: implementer spawned against the existing branch rather than SendMessage."
+  emit "NEXT: $SELF next"
+}
+
+# ---------------------------------------------------------------------------
+# status / summary / show
+# ---------------------------------------------------------------------------
+
+# Slot count == concurrency cap, deliberately: a slot is leased per issue for its whole
+# pipeline, so a third slot only ever exists to run a third issue.
+cmd_cap() {
+  require_state
+  local want="${1:-}" stored inflight
+  stored="$(cat "$STATE/meta/cap")"
+  inflight="$(inflight_count)"
+
+  if [ -z "$want" ]; then
+    emit "CAP: $CAP ($CAP_SRC)"
+    [ "$CAP_SRC" != stored ] && emit "STORED: $stored (masked by the environment override)"
+    emit "IN_FLIGHT: $inflight"
+    emit "SLOTS: $(pool_slots | tr '\n' ' ')"
+    return 0
+  fi
+
+  case "$want" in
+    ''|*[!0-9]*) die "cap: '$want' is not a positive integer" ;;
+  esac
+  [ "$want" -ge 1 ] || die "cap: must be at least 1"
+
+  printf '%s' "$want" > "$STATE/meta/cap"
+  note_global "cap: $stored -> $want"
+  emit "CAP: $stored -> $want"
+
+  if [ -n "${ARTISANAL_SLOP_MAX_INFLIGHT:-}" ]; then
+    warn "ARTISANAL_SLOP_MAX_INFLIGHT=$ARTISANAL_SLOP_MAX_INFLIGHT is set and overrides this for every"
+    warn "invocation that inherits it. Unset it for the new stored value to take effect."
+  fi
+
+  if [ "$want" -gt "$stored" ]; then
+    # Slots are created lazily on acquire, so raising needs no setup at all.
+    emit "New slots are created on demand; run '$SELF next' to start more work now."
+  elif [ "$want" -lt "$stored" ]; then
+    # Nothing in flight is killed — issues above the new cap keep their slots and run
+    # to completion. The cap only gates *starting* new work.
+    local over; over="$(pool_slots | awk -v c="$want" '$1 > c')"
+    if [ "$inflight" -gt "$want" ]; then
+      emit "NOTE: $inflight issue(s) are still in flight, above the new cap of $want."
+      emit "NOTE: They keep their slots and finish normally; no new work starts until"
+      emit "NOTE: the count drops below $want. Nothing was stopped."
+    fi
+    if [ -n "$over" ]; then
+      emit "SLOTS ABOVE CAP: $(printf '%s' "$over" | tr '\n' ' ')"
+      emit "These stay visible to '$SELF pool list' and are reclaimable with"
+      emit "'$SELF pool prune' once their leases are released."
+    fi
+  fi
+  return 0
+}
+
+cmd_pool() {
+  require_state
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list)
+      printf '%-7s %-8s %-28s %-10s %s\n' SLOT LEASE BRANCH SIZE PATH
+      local k p lease br size
+      for k in $(pool_slots); do
+        p="$(slot_path "$k")"
+        lease="$(cat "$(slot_lease "$k")" 2>/dev/null || echo -)"
+        if [ -e "$p/.git" ]; then
+          br="$(git -C "$p" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+          size="$(du -sh "$p" 2>/dev/null | cut -f1)"
+        else
+          br="(not created)"; size="-"
+        fi
+        printf '%-7s %-8s %-28s %-10s %s\n' "$k" "${lease:--}" "$br" "$size" "$p"
+      done
+      ;;
+    reset)
+      # Force a slot back to a pristine base state and drop its lease. The build
+      # cache is preserved — that is the whole point of the pool.
+      local k="${1:?usage: pool reset <slot>}" p n
+      p="$(slot_path "$k")"
+      n="$(cat "$(slot_lease "$k")" 2>/dev/null || true)"
+      [ -n "$n" ] && put "$n" slot ""
+      rm -f "$(slot_lease "$k")"
+      if [ -e "$p/.git" ]; then
+        local gitdir; gitdir="$(git -C "$p" rev-parse --absolute-git-dir 2>/dev/null || true)"
+        [ -n "$gitdir" ] && rm -f "$gitdir/index.lock"
+        git -C "$p" rebase --abort >/dev/null 2>&1 || true
+        git -C "$p" reset --hard  >/dev/null 2>&1 || true
+        local -a keep=(); local x
+        for x in $POOL_KEEP; do keep+=(-e "$x"); done
+        git -C "$p" clean -xdf "${keep[@]}" >/dev/null 2>&1 || true
+        git -C "$p" fetch origin --quiet 2>/dev/null || true
+        git -C "$p" checkout --detach "origin/$DEFAULT_BRANCH" >/dev/null 2>&1 || true
+      fi
+      emit "RESET: slot $k${n:+ (was leased to issue #$n)}; build cache preserved"
+      ;;
+    prune)
+      # Drop unleased slots entirely, reclaiming their build caches.
+      local k p freed=0
+      for k in $(pool_slots); do
+        p="$(slot_path "$k")"
+        [ -e "$p/.git" ] || continue
+        [ -s "$(slot_lease "$k")" ] && continue
+        git -C "$ROOT" worktree remove --force "$p" >/dev/null 2>&1 || rm -rf "$p"
+        freed=$((freed + 1))
+      done
+      git -C "$ROOT" worktree prune >/dev/null 2>&1 || true
+      emit "PRUNED: $freed unleased slot(s) removed"
+      ;;
+    *) die "pool: unknown subcommand '$sub' (list|reset|prune)" ;;
+  esac
+  return 0
+}
+
+cmd_status() {
+  require_state
+  printf '%-6s %-16s %-4s %-6s %-7s %-12s %s\n' ISSUE STATUS CAT PR ROUNDS CLUSTER TITLE
+  local n st blocked
+  for n in $(all_issues); do
+    st="$(get "$n" status ?)"
+    blocked="$(get "$n" blocked_by "")"
+    [ -n "$blocked" ] && st="$st<-#$blocked"
+    printf '%-6s %-16s %-4s %-6s %-7s %-12s %s\n' \
+      "#$n" "$st" "$(get "$n" category -)" \
+      "$(get "$n" pr -)" "$(get "$n" rounds 0)" "$(get "$n" cluster - | cut -c1-12)" \
+      "$(get "$n" title "" | cut -c1-52)"
+  done
+  echo
+  echo "in flight: $(inflight_count)/$CAP   state: $STATE"
+  local phase notes
+  phase="$(cat "$STATE/meta/docs_phase" 2>/dev/null || echo pending)"
+  notes="$(docnote_files | wc -l | tr -d ' ')"
+  echo "deferred doc notes: $notes   docs phase: $phase$(
+    [ -s "$STATE/meta/docs_pr" ] && printf ' (PR #%s)' "$(cat "$STATE/meta/docs_pr")")"
+}
+
+# Inspect or force the end-of-loop documentation phase. `run` exists because the user
+# may stop the loop before the queue drains, and the notes should still be landable.
+cmd_docs() {
+  require_state
+  local sub="${1:-list}"
+  case "$sub" in
+    list)
+      local f n
+      printf 'phase: %s\n' "$(cat "$STATE/meta/docs_phase" 2>/dev/null || echo pending)"
+      [ -s "$STATE/meta/docs_pr" ] && printf 'PR: #%s %s\n' \
+        "$(cat "$STATE/meta/docs_pr")" "$(cat "$STATE/meta/docs_pr_url" 2>/dev/null || true)"
+      for f in $(docnote_files); do
+        n="$(basename "$f" .md)"; n="${n#issue-}"
+        printf '\n--- issue #%s (%s) ---\n' "$n" "$(get "$n" status ?)"
+        cat "$f"
+      done
+      docnotes_pending || echo "(no pending notes)"
+      ;;
+    run)
+      docnotes_pending || { emit "No deferred doc notes; nothing to land."; return 0; }
+      [ "$(inflight_count)" -eq 0 ] \
+        || die "docs run: $(inflight_count) issue(s) in flight — the docs branch would race them. Let them finish, or park them first."
+      rm -f "$STATE/meta/docs_phase"
+      emit_spawn_docs
+      ;;
+    *) die "docs: unknown subcommand '$sub' (list|run)" ;;
+  esac
+  return 0
+}
+
+cmd_summary() {
+  require_state
+  echo "## Issue loop summary — $REPO"
+  echo
+  echo "| Issue | Outcome | PR | Notes |"
+  echo "|---|---|---|---|"
+  local n s out notes
+  for n in $(all_issues); do
+    s="$(get "$n" status ?)"
+    case "$s" in
+      merged)  out="fixed and merged" ;;
+      closed)  out="closed ($(get "$n" verdict "n/a"))" ;;
+      parked)  out="**parked — needs you**" ;;
+      failed)  out="**failed**" ;;
+      skipped) out="skipped" ;;
+      *)       out="in progress ($s)" ;;
+    esac
+    notes="$(tail -1 "$(idir "$n")/log" 2>/dev/null | cut -f2- || true)"
+    printf '| #%s | %s | %s | %s |\n' "$n" "$out" "$(get "$n" pr -)" "${notes//|/\\|}"
+  done
+
+  # The deferred agent-guidance updates, which belong to the run rather than an issue.
+  local phase pending applied
+  phase="$(cat "$STATE/meta/docs_phase" 2>/dev/null || echo pending)"
+  pending="$(docnote_files | wc -l | tr -d ' ')"
+  # `ls` on a missing directory fails, and pipefail would abort the summary.
+  applied="$( { ls -1 "$STATE/docnotes/applied" 2>/dev/null || true; } | wc -l | tr -d ' ')"
+  case "$phase" in
+    done)    printf '| docs | agent-guidance updates merged | %s | %s note(s) applied |\n' \
+               "$(cat "$STATE/meta/docs_pr" 2>/dev/null || echo -)" "$applied" ;;
+    awaiting-merge) printf '| docs | **awaiting your merge** | %s | %s |\n' \
+               "$(cat "$STATE/meta/docs_pr" 2>/dev/null || echo -)" "$(cat "$STATE/meta/docs_pr_url" 2>/dev/null || true)" ;;
+    left-open) printf '| docs | **left open at your request** | %s | %s |\n' \
+               "$(cat "$STATE/meta/docs_pr" 2>/dev/null || echo -)" "$(cat "$STATE/meta/docs_pr_url" 2>/dev/null || true)" ;;
+    skipped) printf '| docs | none landed | - | %s |\n' "$(cat "$STATE/meta/docs_reason" 2>/dev/null || echo 'nothing worth landing')" ;;
+    *)       [ "$pending" -gt 0 ] && printf '| docs | %s deferred note(s) not yet landed | - | run `%s docs run` |\n' "$pending" "$SELF" ;;
+  esac
+
+  echo
+  local human
+  human="$(issues_with_status parked failed | tr '\n' ' ')"
+  [ -n "${human// /}" ] && echo "Needs human follow-up: $human"
+  local held; held="$(issues_with_status held | tr '\n' ' ')"
+  [ -n "${held// /}" ] && echo "Still serialized behind other work: $held"
+  return 0
+}
+
+cmd_show() {
+  require_state
+  local n="$1" f
+  echo "issue #$n — $(get "$n" title)"
+  for f in status category category_src slug pr pr_url branch rounds agent_impl agent_active verdict; do
+    [ -f "$(idir "$n")/$f" ] && printf '  %-14s %s\n' "$f:" "$(get "$n" "$f")"
+  done
+  echo "  blobs:"
+  ls -1 "$(idir "$n")/blob" 2>/dev/null | sed 's/^/    /' || true
+  echo "  log:"
+  sed 's/^/    /' "$(idir "$n")/log" 2>/dev/null || true
+  [ -f "$(idir "$n")/pending" ] && { echo "  pending action:"; sed 's/^/    /' "$(idir "$n")/pending"; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<EOF
+artisanal-slop — deterministic driver for the /artisanal-slop skill
+
+  init [--start N] [--cap N]      create/refresh state, seed the queue from GitHub
+  next                            print the single next ACTION block  <- the main loop
+  ci <issue>                      poll GitHub Actions for that issue's PR, record it
+  record <event> ...              apply a state transition (see the THEN: lines)
+  replan <issue> --merged-pr N    re-plan after a sibling merge changed the premise
+  reconcile                       rebuild state from open PRs after a restart
+  cap [N]                         show or change the concurrency cap = pool size
+  pool list|reset <k>|prune       inspect/repair the persistent worktree slots
+  docs list|run                   deferred agent-doc notes; run the end-of-loop PR now
+  status | summary | show <issue> inspect
+
+Events: classified, spawned, plan-done, impl-done, impl-fixed, impl-failed,
+        review-done, approved, declined, rebased, notified, park, skip,
+        triaged-conflicts, unhold, docs-done, docs-none
+
+Agents run in pooled worktrees under \$STATE/pool/slot-N, leased per issue for the
+whole pipeline so the build cache stays warm across plan -> implement -> review.
+Spawn them WITHOUT the Agent tool's isolation: "worktree" — the script owns isolation.
+
+Agent-guidance files ($DEFERRED_DOCS)
+are never edited inside an issue PR: agents append suggestions to
+\$STATE/docnotes/issue-<N>.md and one end-of-loop PR lands them together. Issues the
+classifier groups into a cluster never run concurrently, and after every merge the
+script only re-reviews siblings whose files the merge actually touched.
+
+Env: ARTISANAL_SLOP_STATE_DIR, ARTISANAL_SLOP_MAX_INFLIGHT (default $DEFAULT_CAP = pool size),
+     ARTISANAL_SLOP_MAX_ROUNDS (default $MAX_ROUNDS), ARTISANAL_SLOP_POOL_KEEP,
+     ARTISANAL_SLOP_ALLOW_DIRTY_ROOT, ARTISANAL_SLOP_DEFERRED_DOCS, ARTISANAL_SLOP_NO_CLUSTERS
+EOF
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    init)      cmd_init "$@" ;;
+    next)      cmd_next "$@" ;;
+    ci)        cmd_ci "$@" ;;
+    record)    cmd_record "$@" ;;
+    replan)    cmd_replan "$@" ;;
+    reconcile) cmd_reconcile "$@" ;;
+    pool)      cmd_pool "$@" ;;
+    docs)      cmd_docs "$@" ;;
+    cap)       cmd_cap "$@" ;;
+    status)    cmd_status "$@" ;;
+    summary)   cmd_summary "$@" ;;
+    show)      cmd_show "$@" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command '$cmd' (try --help)" ;;
+  esac
+}
+
+main "$@"
