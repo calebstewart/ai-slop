@@ -1,6 +1,11 @@
 ---
 name: writing-skills
 description: Guide for authoring high-quality Claude Code skills — writing SKILL.md, crafting the description field, choosing frontmatter, and structuring content with progressive disclosure. Use when the user wants to create, write, author, scaffold, design, or improve a skill, a SKILL.md file, or a custom slash command.
+license: WTFPL-2.0
+metadata:
+  tagline: "How to write a SKILL.md that Claude invokes at the right moment, and no other."
+  tags: "authoring, reference, meta"
+  requires: ""
 ---
 
 # Writing Claude Code Skills

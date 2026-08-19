@@ -67,7 +67,8 @@ at all, the loop says so instead of quietly treating "no checks" as "passing".
 
 ## Requirements
 
-- `git`, [`gh`](https://cli.github.com/) (authenticated), and `jq`
+- `bash` 4+, `git`, [`gh`](https://cli.github.com/) (authenticated), and coreutils —
+  no standalone `jq`, the driver uses `gh`'s embedded `--jq` for all JSON
 - A GitHub repo with issues, run from a clean checkout on the default branch
 - Disk space for the worktree pool — each slot is a full checkout plus build artifacts
 

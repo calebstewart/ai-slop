@@ -3,6 +3,11 @@ name: pr-status
 description: Reviews your open GitHub pull requests with the gh CLI and reports each one's state — reviews, failing checks, merge conflicts, and staleness. Use when the user asks about their open PRs, pending contributions, outstanding or in-progress work, what needs attention, a start-of-day or start-of-week review, or catching up after PTO.
 argument-hint: "[org] [--drafts] [--review-requested]"
 allowed-tools: Bash, AskUserQuestion, Read
+license: WTFPL-2.0
+metadata:
+  tagline: "Triage your open pull requests — who has reviewed, what is failing, what has gone stale."
+  tags: "github, reporting, workflow"
+  requires: "gh, python3"
 ---
 
 # Reviewing open pull requests

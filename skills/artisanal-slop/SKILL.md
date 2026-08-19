@@ -3,6 +3,11 @@ name: artisanal-slop
 description: Mostly-automated issue resolution loop — classify (Haiku), triage & plan (Opus sub-agent), implement (Sonnet sub-agent), independently review (Opus/Sonnet tiered by severity), and merge open GitHub issues continuously. A bash state machine owns the decision tree; you execute its directives. Non-blocking — user approval gates only issue-closes and PR merges, and work on the next issue continues while approval is pending.
 disable-model-invocation: true
 argument-hint: "[issue number to start with]"
+license: WTFPL-2.0
+metadata:
+  tagline: "Works your open GitHub issues end to end — classify, plan, implement, review, merge."
+  tags: "github, automation, sub-agents, worktrees"
+  requires: "bash 4+, git, gh, coreutils"
 ---
 
 # Artisanal Slop — hand-crafted, small-batch issue resolution
