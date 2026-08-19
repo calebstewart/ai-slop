@@ -1,0 +1,103 @@
+{%- extends "base.html" -%}
+
+{%- block meta -%}
+{%- set_global doc_title = section.extra.slug ~ " — " ~ config.title -%}
+{%- set_global doc_description = section.extra.tagline -%}
+{%- set_global doc_type = "article" -%}
+{%- endblock -%}
+{%- block body_class %}doc-page{% endblock -%}
+
+{%- block content %}
+{%- set skill = section.extra %}
+
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="{{ prefix }}/">All skills</a>
+</nav>
+
+<article class="doc">
+  <header class="doc-header">
+    <h1><code>{{ skill.slug }}</code></h1>
+    <p class="doc-tagline">{{ skill.tagline }}</p>
+  </header>
+
+  {#- The facts you want before reading anything: can Claude start this on its
+      own, what has to be on PATH, and what it takes as arguments. Rows are
+      omitted rather than rendered empty when a skill does not declare them. -#}
+  <dl class="facts">
+    <dt>Invoked by</dt>
+    <dd>{{ skill.invocation }}</dd>
+
+    {%- if skill.argument_hint %}
+    <dt>Arguments</dt>
+    <dd><code>/{{ skill.slug }} {{ skill.argument_hint }}</code></dd>
+    {%- endif %}
+
+    {%- if skill.requires | length > 0 %}
+    <dt>Requires</dt>
+    <dd>
+      {%- for tool in skill.requires %}<code>{{ tool }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+    </dd>
+    {%- endif %}
+
+    {%- if skill.tools | length > 0 %}
+    <dt>Pre-approved tools</dt>
+    <dd>
+      {%- for tool in skill.tools %}<code>{{ tool }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+    </dd>
+    {%- endif %}
+
+    {%- if skill.tags | length > 0 %}
+    <dt>Tags</dt>
+    <dd class="tags">
+      {%- for tag in skill.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+    </dd>
+    {%- endif %}
+  </dl>
+
+  <section class="install-snippet">
+    <h2>Install</h2>
+    <pre class="snippet"><code>gh skill install {{ config.extra.repo }} {{ skill.slug }} --agent claude-code --scope user</code></pre>
+    <p class="aside">
+      Other agents, other scopes, and the copy-and-symlink routes are on the
+      <a href="{{ prefix }}/install/">install page</a>.
+    </p>
+  </section>
+
+  <div class="prose">
+    {{ section.content | safe }}
+  </div>
+
+  {#- Everything the skill ships alongside its README. The generator discovers
+      these from the filesystem rather than reading a list, so a new reference
+      file appears here the moment it is committed. -#}
+  <section class="bundled">
+    <h2>Bundled Files</h2>
+    <ul class="file-list">
+      {%- for doc in skill.docs %}
+      <li>
+        <a href="{{ prefix }}{{ doc.url }}">
+          <span class="name"><code>{{ doc.title }}</code></span>
+          <span class="description">{{ doc.subtitle }}</span>
+        </a>
+      </li>
+      {%- endfor %}
+      {%- for asset in skill.assets %}
+      <li>
+        <a href="{{ prefix }}{{ asset.url }}">
+          <span class="name"><code>{{ asset.path }}</code></span>
+          <span class="description">
+            {{ asset.lines }} lines of {{ asset.language }}{% if asset.executable %}, executable{% endif %} — raw
+          </span>
+        </a>
+      </li>
+      {%- endfor %}
+    </ul>
+  </section>
+
+  <p class="source-link">
+    <a href="{{ config.extra.repo_url }}/tree/main/skills/{{ skill.slug }}" target="_blank" rel="noopener"
+      >View this skill on GitHub<span class="visually-hidden"> (opens in a new tab)</span></a
+    >
+  </p>
+</article>
+{%- endblock %}

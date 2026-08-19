@@ -1,0 +1,55 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+
+      # Validates the skills before anything is built: frontmatter, the
+      # name-matches-directory rule, required site metadata, and every relative
+      # link in every README, SKILL.md and reference file. A malformed skill
+      # fails here rather than publishing a page with a dead link.
+      #
+      # Deliberately no binary-cache action: magic-nix-cache-action attempts a
+      # FlakeHub login this repo has no credentials for and annotates every run
+      # red for a build this small.
+      - name: Check
+        run: nix flake check --print-build-logs
+
+      - name: Build site
+        run: nix build .#site --print-build-logs
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # upload-pages-artifact dereferences the Nix store symlink.
+          path: result/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

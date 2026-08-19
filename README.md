@@ -8,6 +8,9 @@ projects. Things here are written for my own workflows, get changed without warn
 and carry no promise of stability, backward compatibility, or good taste. Copy freely;
 expectations, not so much.
 
+Documentation for everything here is published at
+**<https://calebstew.art/ai-slop/>**, generated from these same files.
+
 ## What's in here
 
 Agent skills live under `skills/`, one directory per skill, each with a `SKILL.md`
@@ -115,6 +118,41 @@ ln -s "$PWD/skills/writing-skills" ~/.claude/skills/writing-skills
 
 A `git pull` then updates the skill in place. Symlinked skills have no `gh skill`
 source metadata, so `gh skill update` won't manage them — that's the trade.
+
+## The site
+
+<https://calebstew.art/ai-slop/> is a [Zola](https://www.getzola.org/) site built by
+this repo's flake and deployed to GitHub Pages by `.github/workflows/pages.yml`. It is
+themed to match [calebstew.art](https://calebstew.art), which links to it.
+
+Nothing under `content/skills/` is committed. `scripts/generate-content.py` reads each
+skill's `SKILL.md` frontmatter and `README.md` and writes the content tree at build time,
+so a skill's prose lives in exactly one place and the site cannot drift from what you
+actually install. The `metadata:` map in each `SKILL.md` carries the site-only fields
+(tagline, tags, requirements); everything else on a skill's page is either its README
+verbatim or derived from the filesystem.
+
+```bash
+nix run            # regenerate content/, serve at http://127.0.0.1:1111, watch skills/
+nix run .#gen      # regenerate content/ once and exit
+nix flake check    # lint the skills; see below
+nix build .#site   # the real build, output in ./result
+```
+
+`nix run` keeps watching `skills/` and regenerates when it changes, which Zola then picks
+up and reloads — so editing a skill's README updates the browser. (Zola only watches
+`content/`, which is generated, so without that you would be editing the source and
+seeing nothing.)
+
+`nix develop` puts the same two commands on `PATH` as `slop-serve` and `slop-gen`, if you
+would rather work in a shell.
+
+`nix flake check` is as much a linter for the skills as a check on the site. It fails if a
+`SKILL.md` `name` doesn't match its directory, if required `metadata:` fields are missing,
+if a relative link in any README, `SKILL.md` or reference file doesn't resolve, if a
+bundled script has a shebang but lost its executable bit, or if a template hardcodes a
+root-relative link (the site is served under the `/ai-slop/` path prefix, so those break
+in production while looking fine locally).
 
 ## License
 

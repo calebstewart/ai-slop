@@ -1,0 +1,81 @@
+# Zola configuration. Docs: https://www.getzola.org/documentation/getting-started/configuration/
+#
+# This is a GitHub Pages *project* site, so unlike the landing page at
+# calebstewart.github.io it is served from a path prefix rather than a domain
+# root: /ai-slop/. `base_url` therefore carries that prefix, and it is used only
+# for the absolute URLs Zola generates itself (canonical link, OpenGraph).
+#
+# The templates derive that path prefix from this value at render time rather
+# than hardcoding it, so internal links keep working on both
+# https://calebstewart.github.io/ai-slop/ and https://calebstew.art/ai-slop/ —
+# and under `zola serve`, which rewrites base_url and serves at the root. That
+# mirrors the landing page's root-relative link rule, one level down.
+#
+# If this repo ever gets its own domain and is served at the root, changing this
+# line is the whole migration: no template edits.
+base_url = "https://calebstew.art/ai-slop"
+
+title = "ai-slop"
+description = "Agent skills and prompt scaffolding for Claude Code — what I actually use, documented."
+default_language = "en"
+
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+minify_html = true
+
+[markdown]
+smart_punctuation = true
+
+# Makes every heading its own anchor link, which matters here: the skill READMEs
+# are long and people will want to link to a specific section of one.
+insert_anchor_links = "heading"
+
+# The skill READMEs are largely bash, so highlighting is load-bearing rather
+# than decoration.
+[markdown.highlighting]
+# `class` emits `z-*` classes plus a stylesheet per theme, rather than inlining
+# hex colours on every span. Zola then generates giallo-light.css and
+# giallo-dark.css, which base.html links behind a `prefers-color-scheme` media
+# query. The alternative (`inline`, the default) uses CSS `light-dark()` and
+# works, but it puts a style attribute on every token and leaves nothing for
+# this site's own stylesheet to override — and one thing does need overriding:
+# the themes hardcode a code-block background that isn't our `--surface`.
+style = "class"
+
+# Vitesse because its palette is warm and low-contrast in both directions —
+# `#A65E2B` / `#B07D48` in light, `#C99076` in dark — which is the same register
+# as this site's `--accent` (`#9a5b2e` / `#d9a066`). A cooler theme fights it.
+light_theme = "vitesse-light"
+dark_theme = "vitesse-dark"
+
+# Left false deliberately. An unrecognised fence language should render as plain
+# unhighlighted code, not fail the deploy — a skill author reaching for an odd
+# language tag is not a reason for the site to stop publishing.
+error_on_missing_language = false
+
+[extra]
+tagline = "Agent Skills · Prompt Scaffolding · Claude Code"
+
+repo = "calebstewart/ai-slop"
+repo_url = "https://github.com/calebstewart/ai-slop"
+
+# ---------------------------------------------------------------------------
+# Footer links. `Home` points back at the landing page that links here, which is
+# an absolute URL on purpose: it leaves this project site entirely.
+# ---------------------------------------------------------------------------
+[[extra.social]]
+name = "Home"
+url = "https://calebstew.art"
+
+[[extra.social]]
+name = "Source"
+url = "https://github.com/calebstewart/ai-slop"
+
+[[extra.social]]
+name = "GitHub"
+url = "https://github.com/calebstewart"
+
+[[extra.social]]
+name = "License"
+url = "https://github.com/calebstewart/ai-slop/blob/main/LICENSE"

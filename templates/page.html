@@ -1,0 +1,28 @@
+{%- extends "base.html" -%}
+
+{%- block meta -%}
+{%- set_global doc_title = page.title ~ " — " ~ config.title -%}
+{%- set_global doc_description = page.description | default(value=config.description) -%}
+{%- set_global doc_type = "article" -%}
+{%- endblock -%}
+{%- block body_class %}doc-page{% endblock -%}
+
+{%- block content %}
+
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="{{ prefix }}/">All skills</a>
+</nav>
+
+<article class="doc">
+  <header class="doc-header">
+    <h1>{{ page.title }}</h1>
+    {%- if page.description %}
+    <p class="doc-tagline">{{ page.description }}</p>
+    {%- endif %}
+  </header>
+
+  <div class="prose">
+    {{ page.content | safe }}
+  </div>
+</article>
+{%- endblock %}

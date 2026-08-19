@@ -1,0 +1,26 @@
+<!--
+  Same construction as the favicon on calebstew.art — identical rounded rect,
+  identical colours, identical prefers-color-scheme swap — with the monogram
+  changed so the two are distinguishable in a row of tabs. Served locally rather
+  than fetched, because GitHub sends favicons with max-age=300.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    rect { fill: #201f1c; }
+    text { fill: #fbfbfa; }
+    @media (prefers-color-scheme: dark) {
+      rect { fill: #e8e6e1; }
+      text { fill: #16151a; }
+    }
+  </style>
+  <rect width="32" height="32" rx="7" />
+  <text
+    x="16"
+    y="17"
+    text-anchor="middle"
+    dominant-baseline="central"
+    font-family="ui-monospace, monospace"
+    font-size="17"
+    font-weight="600"
+  >ai</text>
+</svg>

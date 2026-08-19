@@ -1,0 +1,48 @@
+{%- extends "base.html" -%}
+
+{%- block body_class %}home{% endblock -%}
+
+{%- block content %}
+<section class="intro">
+  {{ section.content | safe }}
+</section>
+
+{#- The slug list comes from content/skills/_index.md, which the generator writes
+    from the skills/ directory. Iterating an explicit list rather than
+    `section.subsections` keeps the order deterministic and independent of how
+    Zola happens to sort sections. -#}
+{%- set skills = get_section(path="skills/_index.md") %}
+<nav class="projects" aria-label="Skills">
+  <h2>Skills</h2>
+  <ul>
+    {%- for slug in skills.extra.slugs %}
+    {%- set skill = get_section(path="skills/" ~ slug ~ "/_index.md") %}
+    <li>
+      <a href="{{ prefix }}/skills/{{ slug }}/">
+        <span class="name"><code>{{ slug }}</code></span>
+        <span class="description">{{ skill.extra.tagline }}</span>
+      </a>
+    </li>
+    {%- endfor %}
+  </ul>
+</nav>
+
+<nav class="projects" aria-label="Getting started">
+  <h2>Getting Started</h2>
+  <ul>
+    <li>
+      <a href="{{ prefix }}/install/">
+        <span class="name">Installing</span>
+        <span class="description">Every way to get one of these into your agent, and how to keep it updated.</span>
+      </a>
+    </li>
+    <li>
+      <a href="{{ config.extra.repo_url }}" target="_blank" rel="noopener">
+        <span class="name">Source</span>
+        <span class="description"><code>{{ config.extra.repo }}</code> on GitHub.</span>
+        <span class="visually-hidden"> (opens in a new tab)</span>
+      </a>
+    </li>
+  </ul>
+</nav>
+{%- endblock %}

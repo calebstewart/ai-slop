@@ -1,0 +1,42 @@
+{%- extends "base.html" -%}
+
+{%- block meta -%}
+{%- set_global doc_title = page.title ~ " — " ~ page.extra.skill ~ " — " ~ config.title -%}
+{%- set_global doc_description = page.title ~ " — bundled with the " ~ page.extra.skill ~ " skill." -%}
+{%- set_global doc_type = "article" -%}
+{%- endblock -%}
+{%- block body_class %}doc-page{% endblock -%}
+
+{%- block content %}
+
+<nav class="breadcrumb" aria-label="Breadcrumb">
+  <a href="{{ prefix }}/">All skills</a>
+  <span aria-hidden="true">/</span>
+  <a href="{{ prefix }}/skills/{{ page.extra.skill }}/"><code>{{ page.extra.skill }}</code></a>
+</nav>
+
+<article class="doc">
+  <header class="doc-header">
+    <h1>{{ page.title }}</h1>
+    {#- For a bundled file the interesting subtitle is the other of the two names:
+        the page is titled by the document's own H1, so show the filename, and
+        vice versa for SKILL.md. -#}
+    {%- if page.extra.subtitle and page.extra.subtitle != page.title %}
+    <p class="doc-tagline">{{ page.extra.subtitle }}</p>
+    {%- endif %}
+    <p class="doc-kind">
+      <code>{{ page.extra.source }}</code>
+    </p>
+  </header>
+
+  <div class="prose">
+    {{ page.content | safe }}
+  </div>
+
+  <p class="source-link">
+    <a href="{{ config.extra.repo_url }}/blob/main/{{ page.extra.source }}" target="_blank" rel="noopener"
+      >View this file on GitHub<span class="visually-hidden"> (opens in a new tab)</span></a
+    >
+  </p>
+</article>
+{%- endblock %}
