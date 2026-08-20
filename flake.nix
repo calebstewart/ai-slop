@@ -219,12 +219,68 @@
         # Everything must go through the derived {{ prefix }}.
         template-links = pkgs.runCommand "check-template-links" { } ''
           cd ${src}
+          status=0
           if ${pkgs.gnugrep}/bin/grep -nE '(href|src)="/' templates/*.html; then
             echo
             echo "Root-relative link in a template. This site is served under a path"
             echo "prefix, so use {{ prefix }}/... instead — see templates/base.html."
-            exit 1
+            status=1
           fi
+          # site.js is the other place a rooted path can hide, and the harder one
+          # to spot: the JS builds no URLs at all today, so any literal here is a
+          # mistake waiting to 404 in production only.
+          if ${pkgs.gnugrep}/bin/grep -nE '(href|src|fetch\()[^)]*"/' static/site.js; then
+            echo
+            echo "Root-relative URL in site.js. The site is served under a path prefix."
+            status=1
+          fi
+          [ $status -eq 0 ] && touch $out
+          exit $status
+        '';
+
+        # site.js is hand-written and never templated, so a syntax error in it
+        # would ship silently: every page would render and the catalog filter
+        # would simply never appear. esbuild rather than node purely for closure
+        # size — 12MB against 223MB, for a check that only has to parse.
+        site-js = pkgs.runCommand "check-site-js" { nativeBuildInputs = [ pkgs.esbuild ]; } ''
+          cd ${src}
+          esbuild static/site.js --outfile=/dev/null
+          touch $out
+        '';
+
+        # The catalog filter resolves a chip's facet to a card attribute by
+        # string concatenation: a chip declaring data-facet="tag" reads the
+        # card's `data-tag`. If those drift, the chip renders perfectly and
+        # silently matches nothing — which is indistinguishable from working
+        # until you click it. That bug shipped once already.
+        # Checked against the built HTML rather than the template, because in the
+        # template both sides are Tera expressions — `data-facet="{{ ... }}"` —
+        # so there is nothing to compare until it is rendered.
+        facet-attrs = pkgs.runCommand "check-facet-attrs" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          python3 - <<'EOF'
+          import pathlib, re, sys
+
+          html = pathlib.Path("${self.packages.${pkgs.stdenv.hostPlatform.system}.site}/index.html").read_text(encoding="utf-8")
+
+          # minify_html drops the quotes, so match both forms.
+          facets = sorted(set(re.findall(r'data-facet=\"?([a-z-]+)', html)))
+          if not facets:
+              print("The catalog renders no data-facet chips.")
+              print("If the filter was removed on purpose, remove this check too.")
+              sys.exit(1)
+
+          missing = [f for f in facets if not re.search(r'data-' + f + r'=', html)]
+          for facet in missing:
+              print(f'A chip declares data-facet={facet} but no card emits data-{facet}=.')
+          if missing:
+              print()
+              print("site.js resolves a facet to a card attribute by concatenating")
+              print("'data-' + facet, so the two names have to agree exactly. A")
+              print("mismatch renders a chip that silently matches nothing.")
+              sys.exit(1)
+
+          print(f"ok: {len(facets)} facet(s) wired through to card attributes: {', '.join(facets)}")
+          EOF
           touch $out
         '';
 

@@ -470,12 +470,56 @@ class Skill:
     # -- derived display values ------------------------------------------ #
 
     @property
+    def user_invocable(self) -> bool:
+        """Whether a person can type /<slug> to run it."""
+        return self.meta.get("user-invocable") is not False
+
+    @property
+    def model_invocable(self) -> bool:
+        """Whether Claude can decide to run it unprompted."""
+        return not self.meta.get("disable-model-invocation")
+
+    @property
     def invocation(self) -> str:
-        if self.meta.get("disable-model-invocation"):
-            return f"You only, with /{self.slug}"
-        if self.meta.get("user-invocable") is False:
+        """The prose form, for a skill page's facts list.
+
+        The two booleans above are what the catalog filters and the cards show;
+        this stays a sentence because "you only, with /artisanal-slop" tells a
+        reader more than a pair of ticked boxes.
+
+        Note the third state is currently unreachable: no skill sets
+        `user-invocable: false`. It is here because the field exists, not because
+        anything uses it.
+        """
+        if not self.model_invocable:
+            return f"you only, with /{self.slug}"
+        if not self.user_invocable:
             return "Claude only, automatically"
-        return f"You with /{self.slug}, or Claude automatically"
+        return f"you with /{self.slug}, or Claude automatically"
+
+    @property
+    def invocation_short(self) -> str:
+        """The card-sized form of the same fact."""
+        if not self.model_invocable:
+            return "you only"
+        if not self.user_invocable:
+            return "Claude only"
+        return "you or Claude"
+
+    @property
+    def trigger_keys(self) -> list[str]:
+        """The values the catalog's `trigger:` chips match a card against.
+
+        Vocabulary deliberately matches the chip labels — a chip reading
+        `trigger: auto` filters on the literal string "auto" — so there is no
+        translation table between what the reader sees and what the filter does.
+        """
+        keys = []
+        if self.user_invocable:
+            keys.append("you")
+        if self.model_invocable:
+            keys.append("auto")
+        return keys
 
     def tools(self) -> list[str]:
         raw = self.meta.get("allowed-tools")
@@ -554,6 +598,50 @@ def write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def facets(skills: list["Skill"]) -> list[dict]:
+    """Every catalog filter chip, as a flat `{facet, value, count}` list.
+
+    Flat and uniform on purpose: the chips all render as `facet: value`, so the
+    template is one loop over one shape rather than a hand-written block per
+    facet. Adding a third facet later means adding to this function only.
+
+    `facet` names the card attribute the chip filters on — `trigger` reads
+    `data-trigger`, `tag` reads `data-tags`.
+
+    Counted here rather than in Tera because Tera cannot build or mutate a map,
+    so counting occurrences of a scalar across a list of lists needs a nested
+    accumulator loop. The generator already walks every skill once.
+
+    Counts are totals across the catalog, not counts under the current filter:
+    recomputing them per keystroke would make the numbers jitter as you type,
+    which reads as a bug.
+    """
+    out = [
+        {
+            "facet": "trigger",
+            "value": "you",
+            "count": sum(1 for s in skills if s.user_invocable),
+        },
+        {
+            "facet": "trigger",
+            "value": "auto",
+            "count": sum(1 for s in skills if s.model_invocable),
+        },
+    ]
+
+    counts: dict[str, int] = {}
+    for skill in skills:
+        for tag in csv_list(skill.metadata["tags"]):
+            counts[tag] = counts.get(tag, 0) + 1
+    out += [
+        {"facet": "tag", "value": tag, "count": counts[tag]}
+        # Frequency first so the broadest filters lead; alphabetical within a tie
+        # so the order is stable between builds.
+        for tag in sorted(counts, key=lambda t: (-counts[t], t))
+    ]
+    return out
+
+
 def generate(skills: list[Skill]) -> None:
     if CONTENT_SKILLS.exists():
         shutil.rmtree(CONTENT_SKILLS)
@@ -568,9 +656,12 @@ def generate(skills: list[Skill]) -> None:
         front_matter(
             "Skills",
             "index.html",
-            {"slugs": [s.slug for s in skills]},
+            {
+                "slugs": [s.slug for s in skills],
+                "skill_count": len(skills),
+                "facets": facets(skills),
+            },
             render=False,
-            sort_by="title",
         ),
     )
 
@@ -595,6 +686,10 @@ def generate_skill(skill: Skill) -> None:
         "requires": csv_list(skill.metadata["requires"]),
         "agent_description": skill.meta["description"],
         "invocation": skill.invocation,
+        "invocation_short": skill.invocation_short,
+        "trigger_keys": skill.trigger_keys,
+        # Declared by every skill and, until now, rendered nowhere.
+        "license": skill.meta.get("license", ""),
         "tools": skill.tools(),
         "docs": docs,
         "assets": assets,
@@ -615,7 +710,7 @@ def generate_skill(skill: Skill) -> None:
         CONTENT_SKILLS / skill.slug / "skill.md",
         front_matter(
             "SKILL.md",
-            "skill-doc.html",
+            "doc.html",
             {
                 "skill": skill.slug,
                 "subtitle": skill_title or "",
@@ -637,7 +732,7 @@ def generate_skill(skill: Skill) -> None:
                 CONTENT_SKILLS / skill.slug / f"{kind}-{Path(key).stem}.md",
                 front_matter(
                     doc_title or Path(key).name,
-                    "skill-doc.html",
+                    "doc.html",
                     {
                         "skill": skill.slug,
                         "subtitle": Path(key).name,

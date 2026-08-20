@@ -30,6 +30,10 @@ if it didn't.
 
 ## Installing skills
 
+There is a fuller version of everything below — including a per-agent directory
+table and a troubleshooting section — at
+<https://calebstew.art/ai-slop/install/>.
+
 ### Primary: `gh skill`
 
 The [GitHub CLI](https://cli.github.com/) `skill` command (currently in preview)
@@ -132,6 +136,35 @@ actually install. The `metadata:` map in each `SKILL.md` carries the site-only f
 (tagline, tags, requirements); everything else on a skill's page is either its README
 verbatim or derived from the filesystem.
 
+The shape of the site is three levels, which is the same progressive disclosure
+`writing-skills` argues for: a card catalog, then one page per skill, then its bundled
+files. There is no persistent navigation — a skill page is a document, and the way back
+up is the breadcrumb it renders itself.
+
+`static/site.js` adds two things and neither is load-bearing: the catalog's search and
+filter chips, and a copy button on install commands. Every card, command and link is in
+the HTML, so with JavaScript off you get the whole catalog and no controls — the controls
+are revealed by the script rather than hidden by it, so there is never a dead one.
+
+Filter chips all read `facet: value` (`trigger: auto`, `tag: github`) and come from one
+flat list the generator builds, so adding a facet is a change in one function. The chip's
+facet name doubles as the card attribute it filters on — `tag` reads `data-tag` — and a
+`nix flake check` guards that pairing, because when it drifts the chip renders perfectly
+and silently matches nothing.
+
+Two test scripts, neither wired into CI:
+
+```bash
+node tests/filter.test.js            # the filter, against the real site.js via a DOM stub
+nix build .#site && python3 tests/link-check.py result
+```
+
+`filter.test.js` exists because the facet logic cannot otherwise be verified without a
+browser; it is what caught the `data-tag`/`data-tags` mismatch. `link-check.py` resolves
+every internal link the way a browser would from the page it appears on, against the
+`/ai-slop/` prefix — the one class of bug that local preview cannot show you, since
+`zola serve` runs at the root.
+
 ```bash
 nix run            # regenerate content/, serve at http://127.0.0.1:1111, watch skills/
 nix run .#gen      # regenerate content/ once and exit
@@ -144,15 +177,22 @@ up and reloads — so editing a skill's README updates the browser. (Zola only w
 `content/`, which is generated, so without that you would be editing the source and
 seeing nothing.)
 
+Two things about `zola serve` that cost me an hour each, both worth knowing before they
+cost you one: it writes into `public/`, so running `rm -rf public` while it is up will
+quietly gut the served site while still answering requests for whatever it happens to
+rebuild; and it does not recover from a build error in a file you subsequently fix, so a
+mid-edit broken template leaves you with a 404 at the root until you restart it.
+
 `nix develop` puts the same two commands on `PATH` as `slop-serve` and `slop-gen`, if you
 would rather work in a shell.
 
 `nix flake check` is as much a linter for the skills as a check on the site. It fails if a
 `SKILL.md` `name` doesn't match its directory, if required `metadata:` fields are missing,
 if a relative link in any README, `SKILL.md` or reference file doesn't resolve, if a
-bundled script has a shebang but lost its executable bit, or if a template hardcodes a
-root-relative link (the site is served under the `/ai-slop/` path prefix, so those break
-in production while looking fine locally).
+bundled script has a shebang but lost its executable bit, if a template or `site.js`
+hardcodes a root-relative link (the site is served under the `/ai-slop/` path prefix, so
+those break in production while looking fine locally), if `site.js` does not parse, or if
+a filter chip's facet name has drifted from the card attribute it reads.
 
 ## License
 

@@ -1,0 +1,16 @@
+{#- The only way back up, since the site has no persistent navigation.
+
+    Flat variables rather than a list of maps because Tera has no object
+    literal — `[{"name": ..., "url": ...}]` is a parse error, not a list.
+
+    Set `crumb_current` always; set `crumb_parent_name` and `crumb_parent_url`
+    too when the page sits two levels down. -#}
+<nav class="crumbs" aria-label="Breadcrumb">
+  <a href="{{ prefix }}/">{{ config.title }}</a>
+  {%- if crumb_parent_name %}
+  <span class="sep" aria-hidden="true">/</span>
+  <a href="{{ prefix }}{{ crumb_parent_url }}">{{ crumb_parent_name }}</a>
+  {%- endif %}
+  <span class="sep" aria-hidden="true">/</span>
+  <span aria-current="page">{{ crumb_current }}</span>
+</nav>

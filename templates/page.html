@@ -5,24 +5,39 @@
 {%- set_global doc_description = page.description | default(value=config.description) -%}
 {%- set_global doc_type = "article" -%}
 {%- endblock -%}
-{%- block body_class %}doc-page{% endblock -%}
 
 {%- block content %}
+{%- set crumb_current = page.title %}
+{% include "_crumbs.html" %}
 
-<nav class="breadcrumb" aria-label="Breadcrumb">
-  <a href="{{ prefix }}/">All skills</a>
+<header>
+  <h1 class="doc-title">{{ page.title }}</h1>
+  {%- if page.description %}
+  <p class="lede">{{ page.description }}</p>
+  {%- endif %}
+</header>
+
+{%- if page.toc | length > 2 %}
+<nav class="contents" aria-label="On this page">
+  <h2 class="section-label">On this page</h2>
+  <ul>
+    {%- for heading in page.toc %}
+    <li>
+      <a href="#{{ heading.id }}">{{ heading.title }}</a>
+      {%- if heading.children %}
+      <ul>
+        {%- for child in heading.children %}
+        <li><a href="#{{ child.id }}">{{ child.title }}</a></li>
+        {%- endfor %}
+      </ul>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ul>
 </nav>
+{%- endif %}
 
-<article class="doc">
-  <header class="doc-header">
-    <h1>{{ page.title }}</h1>
-    {%- if page.description %}
-    <p class="doc-tagline">{{ page.description }}</p>
-    {%- endif %}
-  </header>
-
-  <div class="prose">
-    {{ page.content | safe }}
-  </div>
-</article>
+<div class="prose">
+  {{ page.content | safe }}
+</div>
 {%- endblock %}

@@ -5,99 +5,149 @@
 {%- set_global doc_description = section.extra.tagline -%}
 {%- set_global doc_type = "article" -%}
 {%- endblock -%}
-{%- block body_class %}doc-page{% endblock -%}
 
 {%- block content %}
 {%- set skill = section.extra %}
+{%- set crumb_current = skill.slug %}
+{% include "_crumbs.html" %}
 
-<nav class="breadcrumb" aria-label="Breadcrumb">
-  <a href="{{ prefix }}/">All skills</a>
-</nav>
+<header>
+  <h1 class="doc-title is-command">/{{ skill.slug }}</h1>
+  <p class="lede">{{ skill.tagline }}</p>
+</header>
 
-<article class="doc">
-  <header class="doc-header">
-    <h1><code>{{ skill.slug }}</code></h1>
-    <p class="doc-tagline">{{ skill.tagline }}</p>
-  </header>
+{#- Rows are omitted rather than rendered empty: writing-skills takes no
+    arguments and declares no dependencies, and two of the three skills declare
+    no pre-approved tools. -#}
+<dl class="facts">
+  <dt>Invoked by</dt>
+  <dd>{{ skill.invocation }}</dd>
 
-  {#- The facts you want before reading anything: can Claude start this on its
-      own, what has to be on PATH, and what it takes as arguments. Rows are
-      omitted rather than rendered empty when a skill does not declare them. -#}
-  <dl class="facts">
-    <dt>Invoked by</dt>
-    <dd>{{ skill.invocation }}</dd>
+  {%- if skill.argument_hint %}
+  <dt>Arguments</dt>
+  <dd><code>/{{ skill.slug }} {{ skill.argument_hint }}</code></dd>
+  {%- endif %}
 
-    {%- if skill.argument_hint %}
-    <dt>Arguments</dt>
-    <dd><code>/{{ skill.slug }} {{ skill.argument_hint }}</code></dd>
-    {%- endif %}
+  {%- if skill.requires | length > 0 %}
+  <dt>Requires</dt>
+  <dd>
+    {%- for tool in skill.requires %}<code>{{ tool }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+  </dd>
+  {%- endif %}
 
-    {%- if skill.requires | length > 0 %}
-    <dt>Requires</dt>
-    <dd>
-      {%- for tool in skill.requires %}<code>{{ tool }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
-    </dd>
-    {%- endif %}
+  {%- if skill.tools | length > 0 %}
+  <dt>Pre-approved</dt>
+  <dd>
+    {%- for tool in skill.tools %}<code>{{ tool }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
+  </dd>
+  {%- endif %}
 
-    {%- if skill.tools | length > 0 %}
-    <dt>Pre-approved tools</dt>
-    <dd>
-      {%- for tool in skill.tools %}<code>{{ tool }}</code>{% if not loop.last %} · {% endif %}{% endfor %}
-    </dd>
-    {%- endif %}
+  {%- if skill.tags | length > 0 %}
+  <dt>Tags</dt>
+  <dd class="tag-list">
+    {%- for tag in skill.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+  </dd>
+  {%- endif %}
 
-    {%- if skill.tags | length > 0 %}
-    <dt>Tags</dt>
-    <dd class="tags">
-      {%- for tag in skill.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
-    </dd>
-    {%- endif %}
-  </dl>
+  {%- if skill.license %}
+  <dt>License</dt>
+  <dd>{{ skill.license }}</dd>
+  {%- endif %}
+</dl>
 
-  <section class="install-snippet">
-    <h2>Install</h2>
-    <pre class="snippet"><code>gh skill install {{ config.extra.repo }} {{ skill.slug }} --agent claude-code --scope user</code></pre>
-    <p class="aside">
-      Other agents, other scopes, and the copy-and-symlink routes are on the
-      <a href="{{ prefix }}/install/">install page</a>.
-    </p>
-  </section>
-
-  <div class="prose">
-    {{ section.content | safe }}
-  </div>
-
-  {#- Everything the skill ships alongside its README. The generator discovers
-      these from the filesystem rather than reading a list, so a new reference
-      file appears here the moment it is committed. -#}
-  <section class="bundled">
-    <h2>Bundled Files</h2>
-    <ul class="file-list">
-      {%- for doc in skill.docs %}
-      <li>
-        <a href="{{ prefix }}{{ doc.url }}">
-          <span class="name"><code>{{ doc.title }}</code></span>
-          <span class="description">{{ doc.subtitle }}</span>
-        </a>
-      </li>
-      {%- endfor %}
-      {%- for asset in skill.assets %}
-      <li>
-        <a href="{{ prefix }}{{ asset.url }}">
-          <span class="name"><code>{{ asset.path }}</code></span>
-          <span class="description">
-            {{ asset.lines }} lines of {{ asset.language }}{% if asset.executable %}, executable{% endif %} — raw
-          </span>
-        </a>
-      </li>
-      {%- endfor %}
-    </ul>
-  </section>
-
-  <p class="source-link">
-    <a href="{{ config.extra.repo_url }}/tree/main/skills/{{ skill.slug }}" target="_blank" rel="noopener"
-      >View this skill on GitHub<span class="visually-hidden"> (opens in a new tab)</span></a
-    >
+<section class="install">
+  <h2 class="section-label">Install</h2>
+  <pre class="snippet"><code>gh skill install {{ config.extra.repo }} {{ skill.slug }} --agent claude-code --scope user</code></pre>
+  <p class="aside">
+    Other agents, other scopes, and the copy-and-symlink routes are on the
+    <a href="{{ prefix }}/install/">install page</a>.
   </p>
-</article>
+</section>
+
+<div class="prose">
+  {{ section.content | safe }}
+</div>
+
+{#- What replaces a sidebar. The eight prompt templates collapse into a single
+    row naming them, because artisanal-slop would otherwise end with a
+    bundled-file list longer than its own README. -#}
+{%- set skill_docs = skill.docs | filter(attribute="kind", value="skill") %}
+{%- set refs = skill.docs | filter(attribute="kind", value="reference") %}
+{%- set prompts = skill.docs | filter(attribute="kind", value="templates") %}
+
+<section class="ships">
+  <h2 class="section-label">What it ships</h2>
+  <ul class="file-list">
+    {%- for doc in skill_docs %}
+    <li>
+      <a href="{{ prefix }}{{ doc.url }}">
+        <span class="fname">SKILL.md</span>
+        <span class="fdesc">{{ doc.subtitle }} — what the agent is told</span>
+      </a>
+    </li>
+    {%- endfor %}
+
+    {%- for doc in refs %}
+    <li>
+      <a href="{{ prefix }}{{ doc.url }}">
+        <span class="fname">{{ doc.title }}</span>
+        <span class="fdesc">{{ doc.subtitle }}</span>
+      </a>
+    </li>
+    {%- endfor %}
+
+    {%- if prompts | length > 0 %}
+    <li>
+      <a href="{{ prefix }}{{ prompts | first | get(key='url') }}">
+        <span class="fname">{{ prompts | length }} prompt templates</span>
+        <span class="fdesc">the prompts the driver renders for each stage</span>
+        <span class="fnames">
+          {%- for doc in prompts %}{{ doc.title | trim_end_matches(pat=".md") }}{% if not loop.last %} · {% endif %}{% endfor %}
+        </span>
+      </a>
+    </li>
+    {%- endif %}
+
+    {%- for asset in skill.assets %}
+    <li>
+      <a href="{{ prefix }}{{ asset.url }}">
+        <span class="fname">{{ asset.path }}</span>
+        <span class="fdesc">
+          {{ asset.lines }} lines of {{ asset.language }}{% if asset.executable %}, executable{% endif %} — raw file
+        </span>
+      </a>
+    </li>
+    {%- endfor %}
+  </ul>
+</section>
+
+{#- Prev/next through the catalog order, wrapping at both ends so neither edge
+    is a dead stop. -#}
+{%- set all = get_section(path="skills/_index.md") %}
+{%- set slugs = all.extra.slugs %}
+{%- if slugs | length > 1 %}
+{#- One pass to find both neighbours. Tera cannot index an array with an
+    expression (`slugs[i - 1]` is a parse error) and has no negative indexing,
+    so the walk carries the previous slug along with it.
+
+    `before` starts as the last slug and `next_slug` falls back to the first, so
+    both ends wrap and neither edge is a dead stop. -#}
+{%- set_global before = slugs | last -%}
+{%- set_global prev_slug = slugs | last -%}
+{%- set_global next_slug = "" -%}
+{%- set_global passed = false -%}
+{%- for slug in slugs -%}
+  {%- if passed and not next_slug -%}{%- set_global next_slug = slug -%}{%- endif -%}
+  {%- if slug == skill.slug -%}
+    {%- set_global prev_slug = before -%}
+    {%- set_global passed = true -%}
+  {%- endif -%}
+  {%- set_global before = slug -%}
+{%- endfor -%}
+{%- if not next_slug %}{% set_global next_slug = slugs | first %}{% endif %}
+<nav class="pager" aria-label="Other skills">
+  <a class="prev" href="{{ prefix }}/skills/{{ prev_slug }}/">← {{ prev_slug }}</a>
+  <a class="next" href="{{ prefix }}/skills/{{ next_slug }}/">{{ next_slug }} →</a>
+</nav>
+{%- endif %}
 {%- endblock %}

@@ -1,48 +1,107 @@
 {%- extends "base.html" -%}
 
-{%- block body_class %}home{% endblock -%}
-
 {%- block content %}
+<header class="masthead">
+  <h1>{{ config.title }}</h1>
+  <p class="tagline">{{ config.extra.tagline }}</p>
+</header>
+
 <section class="intro">
   {{ section.content | safe }}
 </section>
 
-{#- The slug list comes from content/skills/_index.md, which the generator writes
-    from the skills/ directory. Iterating an explicit list rather than
-    `section.subsections` keeps the order deterministic and independent of how
-    Zola happens to sort sections. -#}
 {%- set skills = get_section(path="skills/_index.md") %}
-<nav class="projects" aria-label="Skills">
-  <h2>Skills</h2>
-  <ul>
+
+<section class="catalog" aria-labelledby="catalog-heading">
+  <h2 class="section-label" id="catalog-heading">Skills</h2>
+
+  {#- Hidden until site.js reveals it: a filter that cannot filter is worse than
+      no filter. Every card below is in the HTML either way, so with JavaScript
+      off you get the whole catalog and no controls. -#}
+  <div class="filters" hidden>
+    <label class="search-field">
+      <span class="visually-hidden">Search skills</span>
+      <input
+        id="skill-search"
+        type="search"
+        placeholder="Search skills…"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <kbd>/</kbd>
+    </label>
+
+    {#- One flat row of chips, all the same shape: `facet: value`, with a count.
+        The facet name is part of the label rather than implied by grouping, so
+        `trigger: auto` and `tag: github` read as the same kind of thing and the
+        row needs no dividers, no headings and no separate fieldsets.
+
+        `data-facet` on each input names the card attribute it filters on
+        (`trigger` reads `data-trigger`), so site.js derives the groups from the
+        chips instead of from DOM ancestry — which is what lets them all live in
+        one container. Semantics are unchanged: OR within a facet, AND across
+        facets.
+
+        A single role="group" rather than a <fieldset> per facet, because each
+        chip's accessible name now carries its own facet ("trigger: auto"),
+        which is more use to a screen reader than a legend two levels up. -#}
+    <div class="chips" role="group" aria-label="Filter skills">
+      {%- for facet in skills.extra.facets %}
+      <label class="chip">
+        <input type="checkbox" data-facet="{{ facet.facet }}" value="{{ facet.value }}" />
+        <span class="chip-key">{{ facet.facet }}</span>
+        <span class="chip-value">{{ facet.value }}</span>
+        <span class="count">{{ facet.count }}</span>
+      </label>
+      {%- endfor %}
+    </div>
+  </div>
+
+  {#- Seeded server-side so it is true before any JavaScript runs. -#}
+  <p class="result-count" id="result-count" role="status">
+    {{ skills.extra.skill_count }} skill{% if skills.extra.skill_count != 1 %}s{% endif %}
+  </p>
+
+  <ul class="card-grid" id="card-grid">
     {%- for slug in skills.extra.slugs %}
     {%- set skill = get_section(path="skills/" ~ slug ~ "/_index.md") %}
-    <li>
-      <a href="{{ prefix }}/skills/{{ slug }}/">
-        <span class="name"><code>{{ slug }}</code></span>
-        <span class="description">{{ skill.extra.tagline }}</span>
+    <li
+      data-name="{{ slug }}"
+      data-trigger="{{ skill.extra.trigger_keys | join(sep='|') }}"
+      {#- Named `data-tag`, singular, to match the chip's facet name exactly:
+          site.js reads `data-` + facet, so `tag: github` looks up `data-tag`.
+          The two have to agree or the facet silently matches nothing. -#}
+      data-tag="{{ skill.extra.tags | join(sep='|') }}"
+      {#- What free-text search matches when the name does not. Metadata only,
+          so every hit is explainable by the card you get back. -#}
+      data-text="{{ slug }} {{ skill.extra.tagline }} {{ skill.extra.agent_description }} {{ skill.extra.tags | join(sep=' ') }} {{ skill.extra.requires | join(sep=' ') }}"
+    >
+      <a class="card" href="{{ prefix }}{{ skill.path }}">
+        {#- The slash command, because that is the thing you type. -#}
+        <span class="card-name">/{{ slug }}</span>
+        <span class="card-tagline">{{ skill.extra.tagline }}</span>
+        <span class="card-facts">
+          <span class="row">
+            <span>{{ skill.extra.invocation_short }}</span>
+          </span>
+          <span class="row">
+            <span class="requires">
+              {%- if skill.extra.requires | length > 0 -%}
+              {{ skill.extra.requires | join(sep=' · ') }}
+              {%- else -%}
+              no dependencies
+              {%- endif -%}
+            </span>
+          </span>
+        </span>
       </a>
     </li>
     {%- endfor %}
   </ul>
-</nav>
 
-<nav class="projects" aria-label="Getting started">
-  <h2>Getting Started</h2>
-  <ul>
-    <li>
-      <a href="{{ prefix }}/install/">
-        <span class="name">Installing</span>
-        <span class="description">Every way to get one of these into your agent, and how to keep it updated.</span>
-      </a>
-    </li>
-    <li>
-      <a href="{{ config.extra.repo_url }}" target="_blank" rel="noopener">
-        <span class="name">Source</span>
-        <span class="description"><code>{{ config.extra.repo }}</code> on GitHub.</span>
-        <span class="visually-hidden"> (opens in a new tab)</span>
-      </a>
-    </li>
-  </ul>
-</nav>
+  <p class="empty-state" id="empty-state" hidden>
+    Nothing matches that.
+    <button type="button" id="filter-reset">Clear the filters</button>
+  </p>
+</section>
 {%- endblock %}

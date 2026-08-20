@@ -1,0 +1,76 @@
+{%- extends "base.html" -%}
+
+{%- block meta -%}
+{%- set_global doc_title = page.title ~ " — " ~ page.extra.skill ~ " — " ~ config.title -%}
+{%- set_global doc_description = page.title ~ " — bundled with the " ~ page.extra.skill ~ " skill." -%}
+{%- set_global doc_type = "article" -%}
+{%- endblock -%}
+
+{%- block content %}
+{%- set crumb_parent_name = page.extra.skill %}
+{%- set crumb_parent_url = "/skills/" ~ page.extra.skill ~ "/" %}
+{%- set crumb_current = page.extra.subtitle %}
+{% include "_crumbs.html" %}
+
+<header>
+  <h1 class="doc-title">{{ page.title }}</h1>
+  <p class="source-note">
+    <code>{{ page.extra.source }}</code> ·
+    <a href="{{ config.extra.repo_url }}/blob/main/{{ page.extra.source }}" target="_blank" rel="noopener"
+      >view on GitHub<span class="visually-hidden"> (opens in a new tab)</span></a
+    >
+  </p>
+</header>
+
+{#- Only where it earns its place. `toc | length` counts top-level entries, which
+    is the right threshold: a page with two H2s and six H3s beneath them still
+    reads as short. -#}
+{%- if page.toc | length > 2 %}
+<nav class="contents" aria-label="On this page">
+  <h2 class="section-label">On this page</h2>
+  <ul>
+    {%- for heading in page.toc %}
+    <li>
+      <a href="#{{ heading.id }}">{{ heading.title }}</a>
+      {%- if heading.children %}
+      <ul>
+        {%- for child in heading.children %}
+        <li><a href="#{{ child.id }}">{{ child.title }}</a></li>
+        {%- endfor %}
+      </ul>
+      {%- endif %}
+    </li>
+    {%- endfor %}
+  </ul>
+</nav>
+{%- endif %}
+
+<div class="prose">
+  {{ page.content | safe }}
+</div>
+
+{#- The skill's other bundled files, so you can move sideways without going back
+    up first. -#}
+{%- set skill = get_section(path="skills/" ~ page.extra.skill ~ "/_index.md") %}
+{%- if skill.extra.docs | length > 1 %}
+<section class="ships">
+  <h2 class="section-label">Also in {{ page.extra.skill }}</h2>
+  <ul class="file-list">
+    {%- for doc in skill.extra.docs %}
+    {%- if doc.url != page.path %}
+    <li>
+      <a href="{{ prefix }}{{ doc.url }}">
+        <span class="fname">{{ doc.title }}</span>
+        <span class="fdesc">{{ doc.subtitle }}</span>
+      </a>
+    </li>
+    {%- endif %}
+    {%- endfor %}
+  </ul>
+</section>
+{%- endif %}
+
+<nav class="pager" aria-label="Back to the skill">
+  <a class="prev" href="{{ prefix }}/skills/{{ page.extra.skill }}/">← {{ page.extra.skill }}</a>
+</nav>
+{%- endblock %}

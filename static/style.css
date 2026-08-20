@@ -1,18 +1,22 @@
 /* --------------------------------------------------------------------------
-   Adapted from calebstew.art's stylesheet so this project site reads as part
-   of the same site. The token block, the `.projects` link-list idiom, the
-   footer, and the a11y rules are that file, unchanged. Everything from
-   "Documentation chrome" down is new: the landing page has two pages of prose
-   and no code, so it never needed prose, table or code-block styling.
+   ai-slop's stylesheet.
 
-   House constants worth keeping if you edit this: colours only ever come from
-   the tokens below, transitions are uniformly 120ms ease, the border radius is
-   uniformly 6px, dark mode is `prefers-color-scheme` with no manual toggle, and
-   there is exactly one breakpoint (30rem).
+   The palette, the fonts, the mono-caps micro-labels, the 6px radius and the
+   120ms transitions are calebstew.art's, so the two sites read as siblings.
+   The layout is not: that site is two pages of prose, this one is a catalog of
+   skills and the long documents they ship.
+
+   House rules, if you edit this:
+     - colours only ever come from the tokens below;
+     - one content width, `--content-max`, on every page — a width that changes
+       between page types reads as breakage, not as design;
+     - no shadows and no sticky positioning: depth comes from a border and a
+       background, movement is a 120ms colour transition, and that is all;
+     - dark mode is `prefers-color-scheme` only. There is no toggle.
    -------------------------------------------------------------------------- */
 
 /* --------------------------------------------------------------------------
-   Palette. Light values live on :root so a color always has a definition
+   Palette. Light values live on :root so a colour always has a definition
    outside of any media query; the dark block only swaps the tokens.
    -------------------------------------------------------------------------- */
 :root {
@@ -23,25 +27,31 @@
   --muted: #6b6862;
   --accent: #9a5b2e;
 
+  /* One step under --surface, for things that should read as inset rather than
+     raised: the search field, filter chips, count badges. */
+  --sunken: #f2f0eb;
+
+  /* A wash of the accent for hover and selected states. Derived rather than
+     given its own hex so it tracks --accent through both schemes. */
+  --accent-wash: color-mix(in srgb, var(--accent) 12%, transparent);
+
   --font-sans:
     ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto,
     "Helvetica Neue", sans-serif;
   --font-mono:
     ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 
-  /* Wider than the landing page's 34rem, and one value for every page here.
-     The landing page can use a pure prose measure because it is pure prose;
-     these pages carry tables and code blocks, so 34rem would force the widest
-     content to scroll. It is the same 46rem the résumé page uses over there,
-     for the same reason.
+  /* One width for everything on the page: prose, tables, code blocks, cards.
+     Nothing is capped narrower than this.
+     
+     An earlier version held prose at 42rem inside a 56rem container, which made
+     paragraphs visibly slimmer than the tables and code blocks beside them and
+     read as a formatting accident rather than as a decision. 46rem is the
+     compromise: about 90 characters per line, which is at the wide end of
+     comfortable but not beyond it, while still fitting a three-column table
+     without scrolling. */
+  --content-max: 46rem;
 
-     Deliberately not two widths: a narrow home page next to wider doc pages
-     makes the whole frame jump on every navigation, which reads as breakage
-     rather than as design. */
-  --measure: 46rem;
-
-  /* Tells the browser both schemes are supported, so form controls, scrollbars
-     and the canvas match the palette instead of staying light in dark mode. */
   color-scheme: light dark;
 }
 
@@ -53,6 +63,7 @@
     --text: #e8e6e1;
     --muted: #9b968e;
     --accent: #d9a066;
+    --sunken: #24232a;
   }
 }
 
@@ -64,7 +75,7 @@
 
 body {
   margin: 0;
-  padding: clamp(2.5rem, 8vh, 6rem) 1.5rem;
+  padding: clamp(2.5rem, 7vh, 4.5rem) 1.5rem clamp(3rem, 8vh, 5rem);
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
@@ -73,34 +84,56 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
-main {
-  max-width: var(--measure);
+.page {
+  max-width: var(--content-max);
   margin: 0 auto;
 }
 
-/* -------------------------------------------------------------------- Header */
-/* No avatar here, unlike the landing page: this is a docs site, not a person. */
-.site-header h1 {
-  margin: 0;
-  font-size: clamp(1.6rem, 5vw, 2rem);
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  line-height: 1.15;
+/* ==========================================================================
+   Shared idioms
+   ========================================================================== */
+
+/* The mono-caps micro-label. Used for every structural label on the site —
+   facts keys, section headings above lists, breadcrumbs. Borrowed wholesale
+   from calebstew.art, where it is the whole visual signature. */
+.label {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+h2.section-label {
+  margin: 0 0 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--muted);
+}
+
+code {
   font-family: var(--font-mono);
 }
 
-.site-header h1 a {
-  color: inherit;
-  text-decoration: none;
+/* ==========================================================================
+   Masthead (catalog only) and breadcrumb (everywhere else)
+   ========================================================================== */
+
+.masthead h1 {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: clamp(1.75rem, 5vw, 2.25rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.1;
 }
 
-.site-header h1 a:hover,
-.site-header h1 a:focus-visible {
-  color: var(--accent);
-}
-
-.tagline {
-  margin: 0.55rem 0 0;
+.masthead .tagline {
+  margin: 0.6rem 0 0;
   font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--muted);
@@ -108,7 +141,43 @@ main {
   text-wrap: balance;
 }
 
-/* --------------------------------------------------------------------- Intro */
+/* There is no persistent navigation anywhere on this site, by design — a skill
+   page is a document, not an application. This is the only way back up, so it
+   is on every page that is not the catalog. */
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: baseline;
+  margin-bottom: 1.75rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+.crumbs a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition:
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.crumbs a:hover,
+.crumbs a:focus-visible {
+  color: var(--accent);
+  border-bottom-color: currentColor;
+}
+
+.crumbs .sep {
+  color: var(--border);
+}
+
+/* ==========================================================================
+   Catalog
+   ========================================================================== */
+
 .intro {
   margin-top: 2.5rem;
 }
@@ -123,199 +192,300 @@ main {
 
 .intro a {
   color: var(--accent);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 
-/* ------------------------------------------------------- Link lists (shared) */
-/* The landing page's project-list idiom, reused verbatim for the skill index
-   and for each skill's bundled-file list, so a row looks the same on both
-   sites. */
-.projects,
-.bundled {
+.catalog {
   margin-top: 3.25rem;
 }
 
-.projects h2,
-.bundled h2,
-.install-snippet h2,
-footer h2 {
-  margin: 0 0 1rem;
-  font-family: var(--font-mono);
-  font-size: 0.7rem;
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.14em;
+/* ----------------------------------------------------------------- Filters */
+/* Hidden until site.js reveals it. A search box that cannot search is worse
+   than no search box, so the control does not exist until it works. */
+.filters {
+  margin-bottom: 1.25rem;
+}
+
+.search-field {
+  position: relative;
+  display: block;
+}
+
+.search-field input {
+  width: 100%;
+  padding: 0.6rem 4.5rem 0.6rem 0.85rem;
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.95rem;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.search-field input::placeholder {
   color: var(--muted);
 }
 
-.projects ul,
-.file-list {
+.search-field input:focus {
+  outline: none;
+  background: var(--surface);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+/* The keyboard hint sits inside the field rather than in the placeholder, so it
+   survives typing. */
+.search-field kbd {
+  position: absolute;
+  top: 50%;
+  right: 0.6rem;
+  transform: translateY(-50%);
+  padding: 0.05rem 0.35rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  pointer-events: none;
+}
+
+/* One flat row. Every chip is the same shape — `facet: value` plus a count — so
+   there is nothing to divide or head, and a third facet would just join the
+   row. */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  align-items: center;
+  margin: 0.85rem 0 0;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+  padding: 0.2rem 0.55rem;
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  /* Mono for the whole chip: `trigger: auto` is a query fragment, not prose,
+     and the fixed pitch is what makes a row of eleven of them read as a set
+     rather than as clutter. */
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  user-select: none;
+  white-space: nowrap;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease,
+    color 120ms ease;
+}
+
+/* The facet name is the quiet half — it repeats down the row, so it recedes and
+   lets the values be what you scan. */
+.chip-key {
+  color: var(--muted);
+}
+
+.chip-key::after {
+  content: ":";
+}
+
+.chip-value {
+  font-weight: 500;
+}
+
+.chip input {
+  /* The chip itself is the affordance; the native box would fight it. State is
+     carried by colour and by :checked below, and the input stays focusable. */
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+
+.chip:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.chip:has(input:checked) {
+  background: var(--accent-wash);
+  border-color: var(--accent);
+}
+
+.chip:has(input:checked) .chip-value {
+  color: var(--accent);
+}
+
+.chip:has(input:focus-visible) {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.chip .count {
+  color: var(--muted);
+  font-size: 0.66rem;
+}
+
+.result-count {
+  margin: 0 0 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
+/* ------------------------------------------------------------------- Cards */
+.card-grid {
+  display: grid;
+  /* 13rem so three cards still fit across a 46rem container
+     (3 × 13 + 2 × 1rem of gap = 41rem); they stretch to fill via 1fr. */
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+  gap: 1rem;
   margin: 0;
   padding: 0;
   list-style: none;
-  border-top: 1px solid var(--border);
 }
 
-.projects li,
-.file-list li {
-  border-bottom: 1px solid var(--border);
-}
-
-.projects a,
-.file-list a {
+.card {
+  /* Column so the facts block can be pushed to the bottom with margin-top:
+     auto — that is what keeps the bottom edges aligned across a row when the
+     taglines are different lengths. */
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.25rem 1rem;
-  padding: 0.85rem 0.5rem;
-  margin: 0 -0.5rem;
+  flex-direction: column;
+  height: 100%;
+  padding: 1.05rem 1.1rem 0.9rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 6px;
   color: inherit;
   text-decoration: none;
   transition:
-    background-color 120ms ease,
-    color 120ms ease;
+    border-color 120ms ease,
+    background-color 120ms ease;
 }
 
-.projects .name,
-.file-list .name {
+.card:hover,
+.card:focus-visible {
+  border-color: var(--accent);
+  background: var(--accent-wash);
+}
+
+.card-name {
+  font-family: var(--font-mono);
+  font-size: 0.95rem;
   font-weight: 600;
-  flex: 0 0 auto;
-}
-
-.projects .name code,
-.file-list .name code {
-  font-family: var(--font-mono);
-  font-size: 0.9em;
-}
-
-.projects .description,
-.file-list .description {
-  flex: 1 1 14rem;
-  font-size: 0.875rem;
-  color: var(--muted);
-}
-
-.projects a:hover,
-.projects a:focus-visible,
-.file-list a:hover,
-.file-list a:focus-visible {
-  background: var(--surface);
   color: var(--accent);
+  overflow-wrap: anywhere;
 }
 
-.projects a:hover .description,
-.projects a:focus-visible .description,
-.file-list a:hover .description,
-.file-list a:focus-visible .description {
-  color: var(--text);
+.card-tagline {
+  flex: 1 1 auto;
+  margin: 0.6rem 0 1.1rem;
+  font-size: 0.9rem;
+  line-height: 1.55;
 }
 
-/* -------------------------------------------------------------------- Footer */
-footer {
-  margin-top: 3.25rem;
-  padding-top: 1.5rem;
+.card-facts {
+  margin-top: auto;
+  padding-top: 0.7rem;
   border-top: 1px solid var(--border);
-}
-
-footer ul {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem 1.5rem;
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-footer a {
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: 0.68rem;
   color: var(--muted);
-  text-decoration: none;
-  border-bottom: 1px solid transparent;
-  transition:
-    color 120ms ease,
-    border-color 120ms ease;
 }
 
-footer a:hover,
-footer a:focus-visible {
+.card-facts .row {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: space-between;
+}
+
+.card-facts .row + .row {
+  margin-top: 0.2rem;
+}
+
+.card-facts .requires {
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.empty-state {
+  margin: 1.5rem 0 0;
+  color: var(--muted);
+}
+
+.empty-state button {
+  padding: 0;
+  background: none;
+  border: 0;
   color: var(--accent);
-  border-bottom-color: currentColor;
+  cursor: pointer;
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
 }
 
 /* ==========================================================================
-   Documentation chrome — all new below this line.
+   Document pages — a skill, a bundled file, the install guide
    ========================================================================== */
 
-.breadcrumb {
-  margin-top: 2.5rem;
-  font-family: var(--font-mono);
-  font-size: 0.72rem;
-  color: var(--muted);
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem;
-  align-items: baseline;
-}
-
-.breadcrumb a {
-  color: var(--muted);
-  text-decoration: none;
-  border-bottom: 1px solid transparent;
-  transition:
-    color 120ms ease,
-    border-color 120ms ease;
-}
-
-.breadcrumb a:hover,
-.breadcrumb a:focus-visible {
-  color: var(--accent);
-  border-bottom-color: currentColor;
-}
-
-.doc-header {
-  margin-top: 1.25rem;
-}
-
-.doc-header h1 {
+.doc-title {
   margin: 0;
-  font-size: clamp(1.5rem, 4.5vw, 1.9rem);
+  font-size: clamp(1.5rem, 4vw, 1.95rem);
   font-weight: 600;
   letter-spacing: -0.02em;
   line-height: 1.2;
   text-wrap: balance;
 }
 
-/* A skill's title *is* its slash command, so it is set in mono — but without
-   the boxed treatment inline code gets in prose. */
-.doc-header h1 code {
+/* A skill's title is the slash command you type, so it is set in mono. A
+   bundled document's title is prose, so it is not. */
+.doc-title.is-command {
   font-family: var(--font-mono);
-  font-size: 0.95em;
+  font-size: clamp(1.35rem, 3.5vw, 1.7rem);
 }
 
-.doc-tagline {
-  margin: 0.6rem 0 0;
-  font-size: 1rem;
+.lede {
+  margin: 0.7rem 0 0;
+  font-size: 1.05rem;
   color: var(--muted);
   text-wrap: balance;
 }
 
-.doc-kind {
-  margin: 0.6rem 0 0;
+.source-note {
+  margin: 0.7rem 0 0;
   font-family: var(--font-mono);
   font-size: 0.72rem;
   color: var(--muted);
 }
 
-/* ---------------------------------------------------------------- Fact panel */
-/* The things you want to know before reading: who can invoke it, what it needs
-   on PATH, what it takes as arguments. */
+.source-note a {
+  color: var(--muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.source-note a:hover,
+.source-note a:focus-visible {
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------------------- Facts */
 .facts {
   display: grid;
-  grid-template-columns: 10rem 1fr;
-  gap: 0.4rem 1rem;
-  margin: 2rem 0 0;
-  padding: 1rem 0 0;
+  grid-template-columns: 8.5rem 1fr;
+  gap: 0.3rem 1.25rem;
+  margin: 2.25rem 0 0;
+  padding: 1.15rem 0 0;
   border-top: 1px solid var(--border);
   font-size: 0.9rem;
 }
@@ -325,9 +495,9 @@ footer a:focus-visible {
   font-size: 0.68rem;
   font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.14em;
   color: var(--muted);
-  padding-top: 0.25rem;
+  padding-top: 0.3rem;
 }
 
 .facts dd {
@@ -335,67 +505,134 @@ footer a:focus-visible {
 }
 
 .facts dd code {
-  font-family: var(--font-mono);
   font-size: 0.85em;
 }
 
-.tags {
+.facts .tag-list {
   display: flex;
   flex-wrap: wrap;
-  gap: 0.35rem;
+  gap: 0.3rem;
 }
 
 .tag {
+  padding: 0.05rem 0.45rem;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
   font-family: var(--font-mono);
   font-size: 0.68rem;
-  color: var(--muted);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.1rem 0.45rem;
 }
 
-/* ------------------------------------------------------------ Install snippet */
-.install-snippet {
-  margin-top: 2.75rem;
+/* ------------------------------------------------------------ Install block */
+.install {
+  margin-top: 2.5rem;
 }
 
-/* Rendered by the template rather than by the markdown pipeline, so it gets no
-   syntax highlighting — hence its own class rather than relying on pre.giallo. */
-pre.snippet {
+.snippet {
+  position: relative;
   margin: 0;
-  padding: 0.9rem 1rem;
+  padding: 0.85rem 1rem;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow-x: auto;
   font-size: 0.8rem;
-  line-height: 1.55;
+  line-height: 1.6;
 }
 
-pre.snippet code {
+.snippet code {
   font-family: var(--font-mono);
 }
 
+/* Injected by site.js, never authored, so there is never a copy button that
+   cannot copy. */
+.copy {
+  position: absolute;
+  top: 0.4rem;
+  right: 0.4rem;
+  padding: 0.15rem 0.5rem;
+  background: var(--sunken);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  transition:
+    color 120ms ease,
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.copy:hover,
+.copy:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.copy.is-done {
+  background: var(--accent-wash);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Room for the button so a long command cannot run underneath it. */
+.snippet:has(.copy) code {
+  padding-right: 3.5rem;
+}
+
 .aside {
-  margin: 0.75rem 0 0;
+  margin: 0.7rem 0 0;
   font-size: 0.85rem;
   color: var(--muted);
 }
 
-.aside a,
-.source-link a {
+.aside a {
   color: var(--accent);
 }
 
-.source-link {
-  margin: 3.25rem 0 0;
-  font-family: var(--font-mono);
-  font-size: 0.75rem;
+/* ------------------------------------------------------- Inline contents */
+.contents {
+  margin: 2.5rem 0 0;
+  padding: 0.9rem 1.1rem;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
 }
 
-/* ========================================================================== */
-/* Prose — the rendered body of a README, a SKILL.md, or a reference file.     */
-/* ========================================================================== */
+.contents ul {
+  margin: 0.5rem 0 0;
+  padding: 0;
+  list-style: none;
+  columns: 2 15rem;
+}
+
+.contents li {
+  break-inside: avoid;
+}
+
+.contents ul ul {
+  columns: 1;
+  margin-left: 0.9rem;
+}
+
+.contents a {
+  display: block;
+  padding: 0.08rem 0;
+  color: var(--muted);
+  font-size: 0.84rem;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.contents a:hover,
+.contents a:focus-visible {
+  color: var(--accent);
+}
+
+/* ==========================================================================
+   Prose — a rendered README, SKILL.md, or reference file
+   ========================================================================== */
 
 .prose {
   margin-top: 2.75rem;
@@ -412,25 +649,24 @@ pre.snippet code {
   letter-spacing: -0.01em;
   line-height: 1.3;
   text-wrap: balance;
-  /* So an anchor jump doesn't park the heading against the viewport edge. */
-  scroll-margin-top: 1.5rem;
+  scroll-margin-top: 1rem;
 }
 
 .prose h2 {
-  margin: 2.75rem 0 0.75rem;
-  font-size: 1.3rem;
-  padding-bottom: 0.35rem;
+  margin: 2.75rem 0 0.85rem;
+  padding-bottom: 0.4rem;
   border-bottom: 1px solid var(--border);
+  font-size: 1.25rem;
 }
 
 .prose h3 {
   margin: 2rem 0 0.6rem;
-  font-size: 1.05rem;
+  font-size: 1.02rem;
 }
 
 .prose h4 {
   margin: 1.5rem 0 0.5rem;
-  font-size: 0.95rem;
+  font-size: 0.92rem;
   color: var(--muted);
 }
 
@@ -466,15 +702,15 @@ pre.snippet code {
 .prose ul,
 .prose ol {
   margin: 0 0 1.1rem;
-  padding-left: 1.15rem;
+  padding-left: 1.2rem;
 }
 
 .prose li + li {
-  margin-top: 0.3rem;
+  margin-top: 0.35rem;
 }
 
 .prose blockquote {
-  margin: 1.25rem 0;
+  margin: 1.4rem 0;
   padding: 0.1rem 0 0.1rem 1rem;
   border-left: 2px solid var(--border);
   color: var(--muted);
@@ -483,7 +719,7 @@ pre.snippet code {
 .prose hr {
   border: 0;
   border-top: 1px solid var(--border);
-  margin: 2.25rem 0;
+  margin: 2.5rem 0;
 }
 
 .prose img {
@@ -491,34 +727,30 @@ pre.snippet code {
   height: auto;
 }
 
-/* ---------------------------------------------------------- Inline code */
-/* The `:not(pre) >` guard is what keeps this off highlighted code blocks,
-   whose tokens are also <code> descendants. */
+/* The `:not(pre) >` guard keeps this off highlighted code blocks, whose tokens
+   are also <code> descendants. */
 .prose :not(pre) > code {
-  font-family: var(--font-mono);
   font-size: 0.85em;
-  background: var(--surface);
+  background: var(--sunken);
   border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0.1em 0.35em;
+  border-radius: 5px;
+  padding: 0.1em 0.32em;
 }
 
-/* ---------------------------------------------------------- Code blocks */
-/* Colours come from the two Giallo stylesheets Zola generates (see
-   config.toml); everything structural is here. The background is overridden
-   because the themes ship their own near-black/near-white, and this site has a
-   `--surface` token that code blocks should sit on like every other raised
-   element. `pre.giallo` outranks the theme's `.z-code` on specificity, so no
+/* Colours come from the two Giallo stylesheets Zola generates; everything
+   structural is here. The background is overridden because the themes ship
+   their own, and this site has a --surface token that raised elements sit on.
+   `pre.giallo` outranks the theme's `.z-code` on specificity, so no
    !important is needed. */
 .prose pre,
 pre.giallo {
-  margin: 1.25rem 0;
+  margin: 1.4rem 0;
   padding: 0.9rem 1rem;
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow-x: auto;
   font-size: 0.8rem;
-  line-height: 1.55;
+  line-height: 1.6;
   tab-size: 4;
 }
 
@@ -526,36 +758,44 @@ pre.giallo {
   background-color: var(--surface);
 }
 
-.prose pre code {
-  font-family: var(--font-mono);
-}
-
 /* -------------------------------------------------------------- Tables */
-/* Load-bearing, not decorative: the skill READMEs use tables for environment
-   variables, flags and bundled-file inventories. Borrows the link-list's
-   row-rule treatment so tables feel like the rest of the site. */
+/* Load-bearing, not decorative: frontmatter.md alone is 38 rows, and the
+   env-var and flag tables are how two of the three skills document their
+   surface.
+
+   Deliberately NOT wrapped in a scrolling container. Zola renders tables from
+   markdown, so there is nowhere to put a wrapper without post-processing the
+   HTML, and the alternative — `display: block` on the table itself — drops the
+   implicit table role in WebKit and Blink, which costs a screen-reader user the
+   row/column relationships. At 56rem every table in this repo is two or three
+   columns and wraps fine, so the wrapper buys nothing. See the narrow-viewport
+   block near the bottom for the one place that trade flips. */
 .prose table {
   width: 100%;
   border-collapse: collapse;
-  margin: 1.25rem 0;
-  font-size: 0.9rem;
+  font-size: 0.88rem;
+}
+
+.prose td {
+  overflow-wrap: anywhere;
 }
 
 .prose th {
-  text-align: left;
-  padding: 0.4rem 0.75rem 0.5rem;
+  padding: 0.35rem 0.75rem 0.5rem;
   border-bottom: 1px solid var(--accent);
   font-family: var(--font-mono);
-  font-size: 0.68rem;
+  font-size: 0.66rem;
   font-weight: 500;
   text-transform: uppercase;
   letter-spacing: 0.12em;
   color: var(--muted);
+  text-align: left;
   vertical-align: bottom;
+  white-space: nowrap;
 }
 
 .prose td {
-  padding: 0.55rem 0.75rem;
+  padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--border);
   vertical-align: top;
 }
@@ -570,51 +810,203 @@ pre.giallo {
   padding-right: 0;
 }
 
-/* Keeps `VARIABLE | default | effect` tables from breaking the identifier
-   across lines while the prose column still wraps. */
+/* Keeps an identifier in a leading column from breaking mid-token while the
+   prose column beside it still wraps. */
 .prose td:first-child code {
   white-space: nowrap;
 }
 
-/* --------------------------------------------------------- <details> */
-.prose details {
-  margin: 1.25rem 0;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 0 1rem;
+/* ==========================================================================
+   What it ships / siblings / prev-next
+   ========================================================================== */
+
+.ships {
+  margin-top: 3.5rem;
+  padding-top: 1.75rem;
+  border-top: 1px solid var(--border);
 }
 
-.prose summary {
-  cursor: pointer;
-  padding: 0.7rem 0;
-  font-family: var(--font-mono);
-  font-size: 0.78rem;
+.file-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file-list li + li {
+  border-top: 1px solid var(--border);
+}
+
+.file-list a,
+.file-list .static-row {
+  display: grid;
+  grid-template-columns: minmax(9rem, max-content) 1fr;
+  gap: 0.15rem 1.25rem;
+  padding: 0.7rem 0.5rem;
+  margin: 0 -0.5rem;
+  border-radius: 6px;
+  color: inherit;
+  text-decoration: none;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.file-list a:hover,
+.file-list a:focus-visible {
+  background: var(--accent-wash);
   color: var(--accent);
 }
 
-/* -------------------------------------------------------------- Responsive */
-@media (max-width: 30rem) {
-  /* The fact panel's label column cannot hold a 10rem gutter on a phone, so it
-     stacks — the same treatment the landing page gives its certification
-     rows. */
+.file-list .fname {
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+.file-list .fdesc {
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.file-list a:hover .fdesc,
+.file-list a:focus-visible .fdesc {
+  color: var(--text);
+}
+
+/* The eight prompt templates collapse into one row rather than eight: the
+   skill that owns them would otherwise have a bundled-file list longer than
+   its README. */
+.file-list .fnames {
+  grid-column: 2;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.pager {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: space-between;
+  margin-top: 3.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+}
+
+.pager a {
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition:
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.pager a:hover,
+.pager a:focus-visible {
+  color: var(--accent);
+  border-bottom-color: currentColor;
+}
+
+.pager .next {
+  margin-left: auto;
+  text-align: right;
+}
+
+/* ==========================================================================
+   Footer
+   ========================================================================== */
+
+.site-footer {
+  margin-top: 4rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--border);
+}
+
+.site-footer ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.site-footer a {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition:
+    color 120ms ease,
+    border-color 120ms ease;
+}
+
+.site-footer a:hover,
+.site-footer a:focus-visible {
+  color: var(--accent);
+  border-bottom-color: currentColor;
+}
+
+/* ==========================================================================
+   Responsive
+   ========================================================================== */
+
+@media (max-width: 34rem) {
   .facts {
     display: block;
   }
 
   .facts dt {
-    padding-top: 0.75rem;
+    padding-top: 0.8rem;
   }
 
-  /* Wide tables scroll rather than forcing the whole page sideways. */
+  .file-list a,
+  .file-list .static-row {
+    display: block;
+  }
+
+  .file-list .fnames {
+    margin-top: 0.2rem;
+  }
+
+  .card-facts .row {
+    display: block;
+  }
+
+  .card-facts .requires {
+    text-align: left;
+  }
+
+  .search-field kbd {
+    display: none;
+  }
+
+  /* The one place the table trade-off flips. A three-column table at 320px is
+     unreadable, and an unreadable table serves nobody — so below this width it
+     becomes a scroll container, accepting the loss of table semantics that
+     `display: block` causes in WebKit and Blink. Above this width the table
+     stays a table. */
   .prose table {
     display: block;
     overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .prose td {
+    white-space: normal;
+    min-width: 8rem;
   }
 }
 
-/* ------------------------------------------------------------------- A11y */
-/* Announces "opens in a new tab" to screen readers without a visual marker.
-   Sighted users get the behaviour; nobody gets a cluttered link row. */
+/* ==========================================================================
+   A11y
+   ========================================================================== */
+
 .visually-hidden {
   position: absolute;
   width: 1px;
