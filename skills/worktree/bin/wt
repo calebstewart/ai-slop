@@ -104,6 +104,22 @@ class WtError(Exception):
 WARNINGS: list[str] = []
 
 
+def _invocation() -> str:
+    """How to spell this program in printed suggestions, so they run as printed.
+
+    Plain `wt` only when the `wt` on PATH is this very file; otherwise the full
+    path, because skills and hooks run wt from wherever it was installed.
+    """
+    me = os.path.realpath(sys.argv[0]) if sys.argv and sys.argv[0] else os.path.realpath(__file__)
+    found = shutil.which("wt")
+    if found and os.path.realpath(found) == me:
+        return "wt"
+    return shlex.quote(me)
+
+
+WT = _invocation()
+
+
 def warn(message: str) -> None:
     WARNINGS.append(message)
     print(f"wt: warning: {message}", file=sys.stderr)
@@ -395,7 +411,7 @@ def allocate_slot(db, proj: Project, want: int | None = None) -> tuple[int, bool
     if slot > cfg["slot_max"]:
         raise WtError(
             f"no free slots between {cfg['slot_min']} and {cfg['slot_max']}",
-            hint="remove trees you are done with (wt cleanup --stale), or raise slot_max",
+            hint=f"remove trees you are done with ({WT} cleanup --stale), or raise slot_max",
         )
     return slot, False
 
@@ -854,7 +870,7 @@ def run_setup(db, proj: Project, name: str, args) -> dict:
             print(tail(result.output), file=sys.stderr)
         raise WtError(
             error,
-            hint=f"fix it and run `wt setup {name}`, or remove the tree with `wt rm {name} --yes`",
+            hint=f"fix it and run `{WT} setup {name}`, or remove the tree with `{WT} rm {name} --yes`",
             name=name, path=str(path), log=str(result.log),
         )
     return {"ran": result is not None, "log": str(result.log) if result else None}
@@ -912,7 +928,7 @@ def resolve_row(db, proj: Project, name: str | None, sess: Session | None):
         row = db.execute("SELECT * FROM trees WHERE project = ? AND path = ?", (proj.key, real)).fetchone()
         if row:
             return row
-        raise WtError(f"no tree named {name!r} in {proj.name}", hint="wt list")
+        raise WtError(f"no tree named {name!r} in {proj.name}", hint=f"{WT} list")
     cwd = os.path.realpath(os.getcwd())
     for row in project_rows(db, proj):
         if cwd == row["path"] or cwd.startswith(row["path"] + os.sep):
@@ -926,7 +942,7 @@ def resolve_row(db, proj: Project, name: str | None, sess: Session | None):
     raise WtError(
         "no tree given, and none could be inferred from the working directory or this session",
         code=EXIT_USAGE,
-        hint="pass a tree name; `wt list` shows them",
+        hint=f"pass a tree name; `{WT} list` shows them",
     )
 
 
@@ -967,16 +983,16 @@ def cmd_new(args) -> int:
                 taken = db.execute(
                     "SELECT name FROM trees WHERE project = ? AND path = ?", (proj.key, wt["path"])
                 ).fetchone()
-                hint = f"wt claim {taken[0]}" if taken else f"wt adopt {wt['path']}"
+                hint = f"{WT} claim {taken[0]}" if taken else f"{WT} adopt {shlex.quote(wt['path'])}"
                 raise WtError(f"branch {spec.branch} is already checked out at {wt['path']}", hint=hint)
     if path.exists():
-        raise WtError(f"{path} already exists", hint=f"register it with `wt adopt {path}`")
+        raise WtError(f"{path} already exists", hint=f"register it with `{WT} adopt {shlex.quote(str(path))}`")
     if spec.source == "new":
         spec.start = resolve_base(proj, args.base)
 
     with txn(db):
         if get_row(db, proj, name):
-            raise WtError(f"a tree named {name} is already registered", hint=f"wt claim {name}")
+            raise WtError(f"a tree named {name} is already registered", hint=f"{WT} claim {name}")
         slot, warm = allocate_slot(db, proj)
         stamp = now()
         db.execute(
@@ -1013,7 +1029,7 @@ def cmd_new(args) -> int:
     text = [f"Created {name} on {info['branch']} (slot {slot}{reused})", tree_summary(info)]
     if not sess:
         text.append("Not claimed: no session identity (pass --session/--pid to claim).")
-    text.append("Run commands in it with `wt exec -- <command>`, or cd into the path.")
+    text.append(f"Run commands in it with `{WT} exec -- <command>`, or cd into the path.")
     emit(args, info, "\n".join(text))
     return EXIT_OK
 
@@ -1073,7 +1089,7 @@ def cmd_setup(args) -> int:
         if h["state"] == "live" and not h["mine"]:
             raise WtError(f"{name} is held by another live session ({describe_holder(h)})", code=EXIT_HELD)
         if not Path(row["path"]).is_dir():
-            raise WtError(f"{row['path']} does not exist", hint=f"wt rm {name} --yes")
+            raise WtError(f"{row['path']} does not exist", hint=f"{WT} rm {name} --yes")
         set_state(db, proj, name, "setting_up", op=True)
         event(db, proj, "setup_rerun", name=name, slot=row["slot"], session=sess.id if sess else None)
     setup = run_setup(db, proj, name, args)
@@ -1103,7 +1119,7 @@ def cmd_claim(args) -> int:
                 raise WtError(
                     f"{name} was last used by session {h['session']}, which has ended",
                     code=EXIT_CONFIRM, holder=h,
-                    hint=f"confirm with the user, then run `wt claim {name} --take-over`",
+                    hint=f"confirm with the user, then run `{WT} claim {name} --take-over`",
                 )
         released = claim(db, proj, name, sess)
     info = describe_tree(proj, get_row(db, proj, name), sess)
@@ -1154,7 +1170,7 @@ def cmd_exec(args) -> int:
     row = resolve_row(db, proj, names[0] if names else None, current_session(args))
     db.close()
     if not Path(row["path"]).is_dir():
-        raise WtError(f"{row['path']} does not exist", hint=f"wt rm {row['name']} --yes")
+        raise WtError(f"{row['path']} does not exist", hint=f"{WT} rm {row['name']} --yes")
     env = dict(os.environ)
     env.update(tree_env(proj, row))
     os.chdir(row["path"])
@@ -1246,17 +1262,17 @@ def find_anomalies(db, proj: Project, sess: Session | None, inventory: bool) -> 
     for row in rows:
         name = row["name"]
         if not Path(row["path"]).is_dir():
-            add("ORPHANED", name, f"registered, but {row['path']} is gone", f"wt rm {name} --yes")
+            add("ORPHANED", name, f"registered, but {row['path']} is gone", f"{WT} rm {name} --yes")
         busy = row["state"] in ("setting_up", "tearing_down")
         if busy and not alive(row["op_pid"], row["op_start"]):
-            fix = f"wt setup {name}" if row["state"] == "setting_up" else f"wt rm {name}"
+            fix = f"{WT} setup {name}" if row["state"] == "setting_up" else f"{WT} rm {name}"
             add("STUCK", name, f"{row['state']} was interrupted (wt process {row['op_pid']} is gone)",
-                f"{fix}, or `wt rm {name}`" if row["state"] == "setting_up" else fix)
+                f"{fix}, or `{WT} rm {name}`" if row["state"] == "setting_up" else fix)
         if row["state"] == "broken":
-            add("BROKEN", name, row["last_error"] or "a hook failed", f"wt setup {name}, or `wt rm {name}`")
+            add("BROKEN", name, row["last_error"] or "a hook failed", f"{WT} setup {name}, or `{WT} rm {name}`")
         h = holder_info(row, sess)
         if h["state"] == "ended" and not h["mine"]:
-            add("STALE", name, f"held by session {h['session'][:8]}, which has ended", "wt cleanup --stale")
+            add("STALE", name, f"held by session {h['session'][:8]}, which has ended", f"{WT} cleanup --stale")
 
     try:
         loose, _ = unregistered(proj, rows)
@@ -1267,7 +1283,7 @@ def find_anomalies(db, proj: Project, sess: Session | None, inventory: bool) -> 
             add("PRUNABLE", entry["name"], "git still lists a worktree whose directory is gone", "git worktree prune")
         else:
             add("UNREGISTERED", entry["name"], f"worktree at {entry['path']} has no registry row",
-                f"wt adopt {entry['path']}")
+                f"{WT} adopt {shlex.quote(entry['path'])}")
 
     if inventory and hook_path(proj, "inventory"):
         result = run_hook(proj, "inventory", env=core_env(proj, "", "", "", ""), cwd=proj.root, label="project")
@@ -1287,10 +1303,10 @@ def find_anomalies(db, proj: Project, sess: Session | None, inventory: bool) -> 
             warm = {r[0] for r in db.execute("SELECT slot FROM warm_slots WHERE project = ?", (proj.key,))}
             for slot in sorted(slots - used - warm):
                 add("LEAKED", f"slot {slot}", "resources exist but no tree uses this slot",
-                    f"wt slots purge {slot} --yes (or `wt slots warm {slot}` to keep them)")
+                    f"{WT} slots purge {slot} --yes (or `{WT} slots warm {slot}` to keep them)")
             for slot in sorted(warm - slots):
                 add("COLD", f"slot {slot}", "recorded as warm, but inventory finds no resources",
-                    f"wt slots purge {slot} --yes")
+                    f"{WT} slots purge {slot} --yes")
     return found
 
 
@@ -1328,15 +1344,15 @@ def cmd_janitor(args) -> int:
                               (proj.key, session_id)).fetchone()
             if mine:
                 lines.append(f"wt: this session holds tree {mine['name']} at {mine['path']};"
-                             f" run `wt claim {mine['name']}` to keep it, and `wt exec -- <cmd>` to work in it.")
+                             f" run `{WT} claim {mine['name']}` to keep it, and `{WT} exec -- <cmd>` to work in it.")
         stale = [a for a in found if a["kind"] == "STALE"]
         other = [a for a in found if a["kind"] != "STALE"]
         if stale:
             lines.append(f"wt: {len(stale)} tree(s) held by ended sessions: "
-                         f"{', '.join(a['subject'] for a in stale)} (wt cleanup --stale)")
+                         f"{', '.join(a['subject'] for a in stale)} ({WT} cleanup --stale)")
         if other:
             lines.append(f"wt: {len(other)} registry problem(s): "
-                         f"{', '.join(a['kind'] + ' ' + a['subject'] for a in other)} (wt status)")
+                         f"{', '.join(a['kind'] + ' ' + a['subject'] for a in other)} ({WT} status)")
         if args.json:
             print(json.dumps({"messages": lines, "anomalies": found}, indent=2))
         elif lines:
@@ -1525,7 +1541,7 @@ def apply_removal(db, proj: Project, plan: dict, args, sess: Session | None) -> 
         with txn(db):
             set_state(db, proj, name, "broken", error=message)
             event(db, proj, "remove_failed", name=name, slot=row["slot"], detail=message)
-        raise WtError(message, code=code, hint=f"fix it and run `wt rm {name} --yes` again")
+        raise WtError(message, code=code, hint=f"fix it and run `{WT} rm {name} --yes` again")
 
     if not getattr(args, "skip_teardown", False) and hook_path(proj, "teardown"):
         env = {**stored_env(row), **core_env(proj, name, row["path"], plan["branch"], row["slot"]),
@@ -1567,7 +1583,7 @@ def cmd_rm(args) -> int:
     sess = current_session(args)
     row = get_row(db, proj, args.name)
     if row is None:
-        raise WtError(f"no tree named {args.name!r} in {proj.name}", hint="wt list")
+        raise WtError(f"no tree named {args.name!r} in {proj.name}", hint=f"{WT} list")
     plan = plan_removal(db, proj, row, sess, args)
     if plan["blocked"]:
         held = plan["holder"]["state"] == "live" and not plan["holder"]["mine"]
@@ -1645,11 +1661,11 @@ def cmd_slots(args) -> int:
         emit(args, data, "\n".join(lines) or "no slots in use")
         return EXIT_OK
     if args.slot is None:
-        raise WtError(f"wt slots {args.action} needs a slot number", code=EXIT_USAGE)
+        raise WtError(f"{WT} slots {args.action} needs a slot number", code=EXIT_USAGE)
     slot = args.slot
     taken = db.execute("SELECT name FROM trees WHERE project = ? AND slot = ?", (proj.key, slot)).fetchone()
     if taken:
-        raise WtError(f"slot {slot} is used by {taken[0]}", hint=f"wt rm {taken[0]}")
+        raise WtError(f"slot {slot} is used by {taken[0]}", hint=f"{WT} rm {taken[0]}")
     if args.action == "warm":
         with txn(db):
             db.execute("INSERT OR REPLACE INTO warm_slots (project, slot, released_at) VALUES (?,?,?)",

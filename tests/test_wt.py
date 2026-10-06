@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -567,6 +568,23 @@ class RegistryTests(Sandbox):
                               input=json.dumps({"session_id": a["id"]}), capture_output=True, text=True)
         self.assertIn("this session holds tree alpha", hook.stdout)
         self.assertEqual(self.wt("janitor", cwd=self.tmp).stdout, "")  # not a repo: silent
+
+    def test_suggested_fixes_run_as_printed(self):
+        self.hook("teardown", TEARDOWN)
+        info = self.wtj("new", "alpha")
+        shutil.rmtree(info["path"])
+
+        def orphan_fix() -> str:
+            return next(a["fix"] for a in self.wtj("status")["anomalies"] if a["kind"] == "ORPHANED")
+
+        # Not on PATH: the full path, which is what a skill or hook has to run.
+        self.assertEqual(orphan_fix(), f"{WT} rm alpha --yes")
+        # On PATH as this same file: the short form.
+        (self.bin / "wt").symlink_to(WT)
+        fix = orphan_fix()
+        self.assertEqual(fix, "wt rm alpha --yes")
+        subprocess.run(shlex.split(fix), cwd=self.root, env=self.env, check=True, capture_output=True)
+        self.assertEqual(self.wtj("list")["trees"], [])
 
     def test_project_is_shared_by_all_worktrees(self):
         info = self.wtj("new", "alpha")
