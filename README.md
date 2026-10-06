@@ -22,11 +22,12 @@ written for the agent.
 | --- | --- |
 | [`artisanal-slop`](skills/artisanal-slop/README.md) | Mostly-automated GitHub issue resolution loop — classify, plan, implement, independently review, and merge open issues continuously. A bash state machine owns the decision tree; sub-agents do the work in a pool of persistent git worktrees. |
 | [`pr-status`](skills/pr-status/README.md) | Triage of your open GitHub pull requests via the `gh` CLI — who has reviewed, what's failing, what conflicts, and what's gone stale — scoped to an org, a user, or the current repo. For start-of-day, start-of-week, or back-from-PTO catch-up. |
+| [`worktree`](skills/worktree/README.md) | One git worktree per piece of work, named from its story, with an isolated test environment set up and torn down by the repository's own hooks. Tracks which Claude session holds each tree, and cleans up after sessions that have ended. |
 | [`writing-skills`](skills/writing-skills/README.md) | Guide for authoring high-quality Claude Code skills — writing `SKILL.md`, crafting the `description` field, choosing frontmatter, and structuring content with progressive disclosure. |
 
-`artisanal-slop` ships an executable driver at `bin/artisanal-slop`. Whichever install
-method you use, check the mode survived it — `chmod +x ~/.claude/skills/artisanal-slop/bin/artisanal-slop`
-if it didn't.
+`artisanal-slop` and `worktree` ship executables (`bin/artisanal-slop`, `bin/wt`).
+Whichever install method you use, check the mode survived it — for example
+`chmod +x ~/.claude/skills/worktree/bin/wt` if it didn't.
 
 ## Installing skills
 

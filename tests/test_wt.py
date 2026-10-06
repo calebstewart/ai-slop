@@ -406,8 +406,11 @@ class RemovalTests(Sandbox):
 
     def test_rm_runs_teardown_with_stored_env_and_removes(self):
         info = self.wtj("new", "alpha")
+        self.hook("teardown", TEARDOWN + 'echo "dropped slot $WT_SLOT"\n')
         out = self.wtj("rm", "alpha", "--yes")
         self.assertTrue(out["applied"])
+        self.assertEqual(out["result"]["teardown"]["rc"], 0)
+        self.assertIn("dropped slot 1", out["result"]["teardown"]["output"])
         self.assertFalse(Path(info["path"]).exists())
         self.assertEqual(self.wtj("list")["trees"], [])
         self.assertIn(f"teardown name=alpha slot=1 mode=destroy dry=0 env=1 cwd={info['path']}",
@@ -585,6 +588,41 @@ class RegistryTests(Sandbox):
         self.assertEqual(fix, "wt rm alpha --yes")
         subprocess.run(shlex.split(fix), cwd=self.root, env=self.env, check=True, capture_output=True)
         self.assertEqual(self.wtj("list")["trees"], [])
+
+    def test_init_creates_stubs_and_local_excludes(self):
+        shutil.rmtree(self.hooks.parent)
+        self.git(self.root, "rm", "--quiet", "--cached", "-r", "--ignore-unmatch", ".claude")
+        exclude = self.root / ".git" / "info" / "exclude"
+        exclude.write_text("")
+        out = self.wtj("init", "--local")
+        self.assertEqual(len(out["created"]), 3)
+        self.assertTrue(os.access(self.hooks / "setup", os.X_OK))
+        self.assertIn("/.claude/worktree/", exclude.read_text())
+        self.assertIn("/.claude/worktrees/", exclude.read_text())
+        self.assertEqual(self.git(self.root, "status", "--porcelain"), "")
+        # the stubs work as they are
+        info = self.wtj("new", "alpha")
+        self.assertEqual(info["state"], "ready")
+        self.assertIn("would destroy the resources of slot 1", self.wtj("rm", "alpha")["plan"]["teardown"]["output"])
+        # a second init keeps what is there and does not duplicate excludes
+        again = self.wtj("init", "--local")
+        self.assertEqual((again["created"], again["excluded"]), ([], []))
+
+    def test_new_ignores_the_trees_directory(self):
+        exclude = self.root / ".git" / "info" / "exclude"
+        exclude.write_text("/.claude/worktree/\n")
+        self.wtj("new", "alpha")
+        self.assertIn("/.claude/worktrees/", exclude.read_text())
+        self.assertEqual(self.git(self.root, "status", "--porcelain"), "")
+
+    def test_common_options_before_or_after_the_command(self):
+        self.wtj("new", "alpha")
+        elsewhere = {"cwd": self.tmp}
+        before = self.wt("-C", str(self.root), "--json", "list", **elsewhere).stdout
+        after = self.wt("list", "-C", str(self.root), "--json", **elsewhere).stdout
+        self.assertEqual(json.loads(before), json.loads(after))
+        ran = self.wt("-C", str(self.root), "exec", "alpha", "--", "sh", "-c", "echo $WT_SLOT", **elsewhere)
+        self.assertEqual(ran.stdout.strip(), "1")
 
     def test_project_is_shared_by_all_worktrees(self):
         info = self.wtj("new", "alpha")

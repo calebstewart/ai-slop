@@ -63,7 +63,7 @@ SCHEMA_VERSION = 1
 # also the required type of the setting.
 DEFAULTS: dict = {
     # Slots are handed out from slot_min upward. Raise it when low numbers are
-    # taken by something else (Portal's root checkout uses test env 1).
+    # taken by something else, such as the root checkout's own test environment.
     "slot_min": 1,
     "slot_max": 999,
     # How many idle slots may keep their resources after their tree is removed.
@@ -735,6 +735,31 @@ def add_worktree(proj: Project, spec: Spec, path: Path) -> None:
         git_retry(proj.root, "worktree", "add", "--quiet", "--no-track", "-b", spec.branch, str(path), spec.start)
 
 
+def exclude_file(proj: Project) -> Path:
+    """The repository's shared info/exclude: personal ignores that are never committed."""
+    out = git(proj.root, "rev-parse", "--git-path", "info/exclude").stdout.strip()
+    path = Path(out)
+    return path if path.is_absolute() else proj.root / path
+
+
+def ensure_excluded(proj: Project, directory: Path, why: str) -> bool:
+    """Ignore `directory` via info/exclude unless something already ignores it."""
+    try:
+        rel = directory.resolve().relative_to(proj.root.resolve())
+    except ValueError:
+        return False  # outside the checkout: nothing for git to see
+    probe = f"{rel.as_posix()}/.wt-probe"
+    if git(proj.root, "check-ignore", "-q", "--no-index", probe, check=False).returncode == 0:
+        return False
+    path = exclude_file(proj)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    sep = "" if not existing or existing.endswith("\n") else "\n"
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(f"{sep}# {why} (added by wt)\n/{rel.as_posix()}/\n")
+    return True
+
+
 # --------------------------------------------------------------------------- #
 # Hooks
 # --------------------------------------------------------------------------- #
@@ -989,6 +1014,7 @@ def cmd_new(args) -> int:
         raise WtError(f"{path} already exists", hint=f"register it with `{WT} adopt {shlex.quote(str(path))}`")
     if spec.source == "new":
         spec.start = resolve_base(proj, args.base)
+    ensure_excluded(proj, proj.trees_dir, "worktrees managed by wt")
 
     with txn(db):
         if get_row(db, proj, name):
@@ -1398,8 +1424,11 @@ def pr_info(proj: Project, branch: str) -> tuple[dict | None, str | None]:
                env={**os.environ, "GH_PROMPT_DISABLED": "1"})
     if proc.returncode:
         message = (proc.stderr or proc.stdout).strip()
-        if "no pull requests found" in message.lower():
+        lowered = message.lower()
+        if "no pull requests found" in lowered:
             return None, None
+        if "none of the git remotes" in lowered or "not a github" in lowered:
+            return None, None  # not hosted on GitHub: there is no PR state to have
         return None, f"could not read PR state: {message.splitlines()[0] if message else proc.returncode}"
     try:
         return json.loads(proc.stdout), None
@@ -1543,11 +1572,13 @@ def apply_removal(db, proj: Project, plan: dict, args, sess: Session | None) -> 
             event(db, proj, "remove_failed", name=name, slot=row["slot"], detail=message)
         raise WtError(message, code=code, hint=f"fix it and run `{WT} rm {name} --yes` again")
 
+    teardown = None
     if not getattr(args, "skip_teardown", False) and hook_path(proj, "teardown"):
         env = {**stored_env(row), **core_env(proj, name, row["path"], plan["branch"], row["slot"]),
                "WT_TEARDOWN_MODE": mode, "WT_DRY_RUN": "0"}
         result = run_hook(proj, "teardown", env=env, cwd=Path(row["path"]) if exists else proj.root,
                           label=name, stream=getattr(args, "verbose", False))
+        teardown = {"rc": result.rc, "output": result.output, "log": str(result.log)}
         if result.rc != 0:
             if not args.json and not getattr(args, "verbose", False):
                 print(tail(result.output), file=sys.stderr)
@@ -1574,7 +1605,8 @@ def apply_removal(db, proj: Project, plan: dict, args, sess: Session | None) -> 
             db.execute("DELETE FROM warm_slots WHERE project = ? AND slot = ?", (proj.key, row["slot"]))
         event(db, proj, "removed", name=name, slot=row["slot"], session=sess.id if sess else None,
               detail=f"{mode}; branch {branch_result or 'kept'}")
-    return {"name": name, "mode": mode, "branch": plan["branch"], "branch_result": branch_result or "kept"}
+    return {"name": name, "mode": mode, "branch": plan["branch"], "branch_result": branch_result or "kept",
+            "teardown": teardown}
 
 
 def cmd_rm(args) -> int:
@@ -1645,6 +1677,91 @@ def cmd_cleanup(args) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# Commands: init
+# --------------------------------------------------------------------------- #
+
+SETUP_STUB = """\
+#!/bin/sh
+# wt setup hook. Runs from the root checkout's copy, with the new tree as cwd.
+#
+# Inputs:  WT_NAME WT_BRANCH WT_PATH WT_ROOT WT_PROJECT WT_GIT_COMMON_DIR
+#          WT_SLOT       small integer, unique among this project's trees
+#          WT_SLOT_WARM  1 if the slot's resources survived from an earlier tree
+# Output:  KEY=VALUE lines appended to "$WT_ENV_OUT". wt stores them and passes
+#          them to every `wt exec` in this tree, and to teardown.
+# Exit non-zero to mark the tree broken; it is kept so you can debug it.
+set -eu
+
+# Derive isolated resources from the slot, for example:
+# echo "TEST_ENV_NUMBER=$WT_SLOT" >> "$WT_ENV_OUT"
+# echo "PORT_OFFSET=$((10000 + WT_SLOT * 100))" >> "$WT_ENV_OUT"
+# echo "COMPOSE_PROJECT_NAME=$WT_PROJECT-wt$WT_SLOT" >> "$WT_ENV_OUT"
+"""
+
+TEARDOWN_STUB = """\
+#!/bin/sh
+# wt teardown hook. Runs from the root checkout's copy, with the tree as cwd, or
+# the root checkout when the tree's directory is already gone.
+#
+# Inputs:  everything setup received, everything setup wrote, and
+#          WT_TEARDOWN_MODE  release: keep the slot's resources for the next tree
+#                            destroy: remove them
+#          WT_DRY_RUN        1: print what you would do, change nothing
+# WT_NAME, WT_BRANCH and WT_PATH are empty when purging a slot no tree owns.
+# Exit non-zero whenever you cannot be sure what exists; wt then removes nothing.
+set -eu
+
+if [ "$WT_DRY_RUN" = 1 ]; then
+    echo "would $WT_TEARDOWN_MODE the resources of slot $WT_SLOT"
+    exit 0
+fi
+"""
+
+
+def config_stub() -> str:
+    lines = ["# wt settings. Every setting is optional; the values shown are the defaults.", ""]
+    for key, value in DEFAULTS.items():
+        if isinstance(value, bool):
+            rendered = "true" if value else "false"
+        elif isinstance(value, list):
+            rendered = "[" + ", ".join(json.dumps(v) for v in value) + "]"
+        elif isinstance(value, str):
+            rendered = json.dumps(value)
+        else:
+            rendered = str(value)
+        lines.append(f"# {key} = {rendered}")
+    return "\n".join(lines) + "\n"
+
+
+def cmd_init(args) -> int:
+    proj = load_project(args.C)
+    hooks = proj.hooks
+    hooks.mkdir(parents=True, exist_ok=True)
+    created, kept = [], []
+    for name, body, mode in (
+        ("config.toml", config_stub(), 0o644),
+        ("setup", SETUP_STUB, 0o755),
+        ("teardown", TEARDOWN_STUB, 0o755),
+    ):
+        path = hooks / name
+        if path.exists():
+            kept.append(str(path))
+            continue
+        path.write_text(body, encoding="utf-8")
+        path.chmod(mode)
+        created.append(str(path))
+    excluded = []
+    if args.local and ensure_excluded(proj, hooks, "wt hooks for this checkout only"):
+        excluded.append(str(hooks))
+    if ensure_excluded(proj, proj.trees_dir, "worktrees managed by wt"):
+        excluded.append(str(proj.trees_dir))
+    lines = [f"Created {p}" for p in created] + [f"Kept existing {p}" for p in kept]
+    lines += [f"Ignored {p} in {exclude_file(proj)}" for p in excluded]
+    emit(args, {"created": created, "kept": kept, "excluded": excluded}, "\n".join(lines))
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
 # Commands: slots
 # --------------------------------------------------------------------------- #
 
@@ -1705,15 +1822,27 @@ def cmd_slots(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    def common_options(p: argparse.ArgumentParser, suppress: bool) -> None:
+        # Accepted before or after the subcommand. On the subcommand the defaults
+        # are suppressed, so `wt -C DIR list` is not reset by list's own -C.
+        def default(value):
+            return argparse.SUPPRESS if suppress else value
+
+        p.add_argument("-C", metavar="DIR", default=default(None), help="run as if started in DIR")
+        p.add_argument("--json", action="store_true", default=default(False), help="machine-readable output")
+        p.add_argument("--session", default=default(None),
+                       help="session id (default: $WT_SESSION_ID, $CLAUDE_CODE_SESSION_ID)")
+        p.add_argument("--pid", type=int, default=default(None),
+                       help="session process id (default: $WT_PID, $CLAUDE_PID)")
+        p.add_argument("-v", "--verbose", action="store_true", default=default(False),
+                       help="stream hook output to stderr")
+
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("-C", metavar="DIR", help="run as if started in DIR")
-    common.add_argument("--json", action="store_true", help="machine-readable output")
-    common.add_argument("--session", help="session id (default: $WT_SESSION_ID, $CLAUDE_CODE_SESSION_ID)")
-    common.add_argument("--pid", type=int, help="session process id (default: $WT_PID, $CLAUDE_PID)")
-    common.add_argument("-v", "--verbose", action="store_true", help="stream hook output to stderr")
+    common_options(common, suppress=True)
 
     parser = argparse.ArgumentParser(prog="wt", description=__doc__.split("\n\n")[0],
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    common_options(parser, suppress=False)
     parser.add_argument("--version", action="version", version=f"wt {VERSION}")
     sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -1780,6 +1909,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stale", action="store_true", required=True, help="trees held by ended sessions")
     p.add_argument("--include-unclaimed", action="store_true", help="also trees nobody holds")
     removal_flags(p)
+
+    p = add("init", cmd_init, "create stub hooks in .claude/worktree/ for this repository")
+    p.add_argument("--local", action="store_true",
+                   help="keep the hooks out of git via .git/info/exclude instead of committing them")
 
     p = add("slots", cmd_slots, "list slots, or warm/purge an idle one")
     p.add_argument("action", nargs="?", choices=["list", "warm", "purge"], default="list")
