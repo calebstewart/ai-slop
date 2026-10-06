@@ -328,6 +328,28 @@
           touch $out
         '';
 
+        # skills/worktree/bin/wt drives real git repositories, a SQLite registry
+        # and real processes, so its tests are end-to-end: every test builds a
+        # bare origin and a clone in a temp dir and runs wt as a subprocess.
+        # Hook scripts in the tests are POSIX sh because the Linux sandbox has
+        # /bin/sh and nothing else at a fixed path.
+        wt =
+          pkgs.runCommand "check-wt"
+            {
+              nativeBuildInputs = [
+                pkgs.python3
+                pkgs.git
+                pkgs.coreutils
+                pkgs.gnused
+                pkgs.ps # wt reads process start times from it on darwin
+              ];
+            }
+            ''
+              cd ${src}
+              HOME=$TMPDIR python3 tests/test_wt.py
+              touch $out
+            '';
+
         # Catches template errors, which none of the checks above would see.
         # Shares the derivation CI builds anyway, so it costs nothing there.
         site = self.packages.${pkgs.stdenv.hostPlatform.system}.site;

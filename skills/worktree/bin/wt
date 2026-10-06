@@ -1,0 +1,1797 @@
+#!/usr/bin/env python3
+"""wt — git worktrees with isolated environments, tracked per project and per session.
+
+Every project (a git repository, identified by its shared .git directory) has a
+registry of worktrees in one SQLite database. Each tree holds a small integer
+*slot*, unique within its project, which the repository's own scripts turn into
+real resources: a test-database suffix, a port offset, a compose project name.
+Each tree can be claimed by one Claude session at a time, and a session holds at
+most one tree.
+
+Repository hooks live in <root>/.claude/worktree/ and always run from the root
+checkout's copy, so they work whether that directory is committed or ignored:
+
+    config.toml   optional settings; see DEFAULTS below
+    setup         initialise a tree; write KEY=VALUE lines to $WT_ENV_OUT
+    teardown      release or destroy a tree's resources; honours WT_DRY_RUN
+    inventory     print the slots that have resources in reality, one per line
+
+Run `wt <command> --help` for each command. Every command accepts --json.
+
+Exit codes: 0 ok, 1 error, 2 usage, 3 held by another live session,
+4 needs confirmation (pass --take-over), 5 refused (unsafe, or a hook was unsure).
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+if sys.version_info < (3, 11):  # tomllib
+    sys.exit("wt: python 3.11 or newer is required")
+
+import tomllib  # noqa: E402
+
+VERSION = "0.1.0"
+
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_HELD = 3
+EXIT_CONFIRM = 4
+EXIT_REFUSED = 5
+
+SCHEMA_VERSION = 1
+
+# Every key config.toml may set, with its default. The type of each default is
+# also the required type of the setting.
+DEFAULTS: dict = {
+    # Slots are handed out from slot_min upward. Raise it when low numbers are
+    # taken by something else (Portal's root checkout uses test env 1).
+    "slot_min": 1,
+    "slot_max": 999,
+    # How many idle slots may keep their resources after their tree is removed.
+    # A new tree prefers one of these, and setup sees WT_SLOT_WARM=1. 0 disables.
+    "warm_slots": 0,
+    "worktrees_dir": ".claude/worktrees",
+    "remote": "origin",
+    # Start point for new branches. Empty means <remote>/HEAD.
+    "base": "",
+    # Fetch the base branch before branching from it.
+    "fetch": True,
+    # Leading branch segments that are a type rather than part of the name.
+    "branch_types": ["feature", "bug", "chore", "fix", "hotfix", "refactor", "docs", "test"],
+    "default_type": "feature",
+    # Branch created for a story that has none yet. Fields: type, id, slug.
+    "story_branch": "{type}/sc-{id}-{slug}",
+    "slug_max": 50,
+    "name_max": 60,
+    # Trees under worktrees_dir that wt never manages or reports as unregistered.
+    "unmanaged": ["agent-*"],
+}
+
+STORY_RE = re.compile(r"(?<![A-Za-z0-9])sc-(\d+)(?![0-9])", re.IGNORECASE)
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+class WtError(Exception):
+    def __init__(self, message: str, code: int = EXIT_ERROR, hint: str | None = None, **data):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.hint = hint
+        self.data = data
+
+
+WARNINGS: list[str] = []
+
+
+def warn(message: str) -> None:
+    WARNINGS.append(message)
+    print(f"wt: warning: {message}", file=sys.stderr)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------------- #
+# Subprocesses and git
+# --------------------------------------------------------------------------- #
+
+
+def run(cmd: list[str], cwd=None, check: bool = True, env=None) -> subprocess.CompletedProcess:
+    try:
+        proc = subprocess.run(
+            cmd, cwd=cwd, env=env, capture_output=True, text=True, stdin=subprocess.DEVNULL
+        )
+    except FileNotFoundError as exc:
+        raise WtError(f"{cmd[0]}: not found") from exc
+    if check and proc.returncode:
+        detail = (proc.stderr or proc.stdout).strip()
+        raise WtError(f"`{shlex.join(cmd)}` failed: {detail}")
+    return proc
+
+
+def git(cwd, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return run(["git", "-C", str(cwd), *args], check=check)
+
+
+def git_retry(cwd, *args: str, attempts: int = 8) -> subprocess.CompletedProcess:
+    """Retry git commands that lose a race for a lock (config, refs, packed-refs).
+
+    Several wt processes may create trees in one repository at once, and git
+    takes short-lived locks on shared files rather than waiting for them.
+    """
+    for attempt in range(attempts):
+        proc = git(cwd, *args, check=False)
+        if proc.returncode == 0:
+            return proc
+        if "lock" not in proc.stderr.lower() or attempt == attempts - 1:
+            raise WtError(f"`git {shlex.join(args)}` failed: {proc.stderr.strip()}")
+        time.sleep(0.1 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def parse_worktrees(cwd) -> list[dict]:
+    out = git(cwd, "worktree", "list", "--porcelain").stdout
+    entries: list[dict] = []
+    current: dict | None = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            current = {"path": os.path.realpath(line[len("worktree "):])}
+            entries.append(current)
+        elif current is None:
+            continue
+        elif line.startswith("branch "):
+            current["branch"] = line[len("branch "):].removeprefix("refs/heads/")
+        elif line == "detached":
+            current["detached"] = True
+        elif line == "bare":
+            current["bare"] = True
+        elif line.startswith("prunable"):
+            current["prunable"] = True
+        elif line.startswith("locked"):
+            current["locked"] = True
+    return entries
+
+
+def valid_branch_name(cwd, name: str) -> bool:
+    return git(cwd, "check-ref-format", "--branch", name, check=False).returncode == 0
+
+
+# --------------------------------------------------------------------------- #
+# Projects and configuration
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class Project:
+    key: str  # realpath of the shared .git directory
+    root: Path  # the main worktree
+    config: dict
+
+    @property
+    def name(self) -> str:
+        return self.root.name
+
+    @property
+    def hooks(self) -> Path:
+        return self.root / ".claude" / "worktree"
+
+    @property
+    def trees_dir(self) -> Path:
+        return Path(os.path.realpath(self.root / self.config["worktrees_dir"]))
+
+    @property
+    def remote(self) -> str:
+        return self.config["remote"]
+
+    def has_remote(self) -> bool:
+        return self.remote in git(self.root, "remote").stdout.split()
+
+
+def load_config(root: Path) -> dict:
+    cfg = copy.deepcopy(DEFAULTS)
+    path = root / ".claude" / "worktree" / "config.toml"
+    if path.is_file():
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except tomllib.TOMLDecodeError as exc:
+            raise WtError(f"{path}: {exc}") from exc
+        for key, value in data.items():
+            if key not in DEFAULTS:
+                raise WtError(f"{path}: unknown setting {key!r}", hint=f"known: {', '.join(DEFAULTS)}")
+            want = type(DEFAULTS[key])
+            if type(value) is not want:
+                raise WtError(f"{path}: {key} must be a {want.__name__}")
+            cfg[key] = value
+    if cfg["slot_min"] < 0 or cfg["slot_max"] < cfg["slot_min"]:
+        raise WtError(f"{path}: need 0 <= slot_min <= slot_max")
+    if cfg["warm_slots"] < 0:
+        raise WtError(f"{path}: warm_slots must not be negative")
+    return cfg
+
+
+def load_project(start) -> Project:
+    start = Path(start or os.getcwd())
+    proc = git(start, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if proc.returncode:
+        raise WtError(f"{start} is not inside a git repository")
+    key = os.path.realpath(proc.stdout.strip())
+    worktrees = parse_worktrees(start)
+    if not worktrees or worktrees[0].get("bare"):
+        raise WtError("bare repositories are not supported")
+    root = Path(worktrees[0]["path"])
+    return Project(key=key, root=root, config=load_config(root))
+
+
+# --------------------------------------------------------------------------- #
+# Registry
+# --------------------------------------------------------------------------- #
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS trees (
+    project       TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    root          TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    branch        TEXT,
+    story         TEXT,
+    slot          INTEGER NOT NULL,
+    slot_warm     INTEGER NOT NULL DEFAULT 0,
+    state         TEXT NOT NULL
+                  CHECK (state IN ('setting_up', 'ready', 'tearing_down', 'broken')),
+    env_json      TEXT NOT NULL DEFAULT '{}',
+    last_error    TEXT,
+    op_pid        INTEGER,
+    op_start      TEXT,
+    claim_session TEXT,
+    claim_pid     INTEGER,
+    claim_start   TEXT,
+    claimed_at    TEXT,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (project, name),
+    UNIQUE (project, slot)
+);
+CREATE INDEX IF NOT EXISTS trees_by_claim ON trees (claim_session);
+CREATE TABLE IF NOT EXISTS warm_slots (
+    project     TEXT NOT NULL,
+    slot        INTEGER NOT NULL,
+    released_at TEXT NOT NULL,
+    PRIMARY KEY (project, slot)
+);
+CREATE TABLE IF NOT EXISTS events (
+    id      INTEGER PRIMARY KEY,
+    project TEXT NOT NULL,
+    name    TEXT,
+    slot    INTEGER,
+    at      TEXT NOT NULL,
+    kind    TEXT NOT NULL,
+    session TEXT,
+    detail  TEXT
+);
+"""
+
+
+def wt_home() -> Path:
+    env = os.environ.get("WT_HOME")
+    return Path(env) if env else Path.home() / ".claude" / "wt"
+
+
+def open_db() -> sqlite3.Connection:
+    home = wt_home()
+    home.mkdir(parents=True, exist_ok=True)
+    db = sqlite3.connect(home / "registry.sqlite", timeout=30, isolation_level=None)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 30000")
+    db.execute("PRAGMA journal_mode = WAL")
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version > SCHEMA_VERSION:
+        raise WtError(f"the registry was written by a newer wt (schema {version})")
+    if version < SCHEMA_VERSION:
+        with txn(db):
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    return db
+
+
+@contextmanager
+def txn(db: sqlite3.Connection):
+    """BEGIN IMMEDIATE: take the write lock up front so read-then-write is atomic."""
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        db.execute("ROLLBACK")
+        raise
+    db.execute("COMMIT")
+
+
+def get_row(db, proj: Project, name: str):
+    return db.execute("SELECT * FROM trees WHERE project = ? AND name = ?", (proj.key, name)).fetchone()
+
+
+def project_rows(db, proj: Project) -> list:
+    return db.execute("SELECT * FROM trees WHERE project = ? ORDER BY name", (proj.key,)).fetchall()
+
+
+def event(db, proj: Project, kind: str, name=None, slot=None, session=None, detail=None) -> None:
+    db.execute(
+        "INSERT INTO events (project, name, slot, at, kind, session, detail) VALUES (?,?,?,?,?,?,?)",
+        (proj.key, name, slot, now(), kind, session, detail),
+    )
+
+
+def set_state(db, proj: Project, name: str, state: str, *, op: bool = False, error=None, **extra) -> None:
+    fields = {"state": state, "updated_at": now(), "last_error": error}
+    if op:
+        fields["op_pid"] = os.getpid()
+        fields["op_start"] = proc_start(os.getpid())
+    else:
+        fields["op_pid"] = None
+        fields["op_start"] = None
+    fields.update(extra)
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    db.execute(
+        f"UPDATE trees SET {assignments} WHERE project = ? AND name = ?",
+        (*fields.values(), proj.key, name),
+    )
+
+
+def allocate_slot(db, proj: Project, want: int | None = None) -> tuple[int, bool]:
+    """Pick a slot inside an open transaction. Returns (slot, warm)."""
+    cfg = proj.config
+    used = {r[0] for r in db.execute("SELECT slot FROM trees WHERE project = ?", (proj.key,))}
+    warm = [
+        r[0]
+        for r in db.execute("SELECT slot FROM warm_slots WHERE project = ? ORDER BY slot", (proj.key,))
+    ]
+
+    def take_warm(slot: int) -> None:
+        db.execute("DELETE FROM warm_slots WHERE project = ? AND slot = ?", (proj.key, slot))
+
+    if want is not None:
+        if want in used:
+            holder = db.execute(
+                "SELECT name FROM trees WHERE project = ? AND slot = ?", (proj.key, want)
+            ).fetchone()[0]
+            raise WtError(f"slot {want} is already used by {holder}")
+        if want < 0:
+            raise WtError("slots are not negative")
+        if want in warm:
+            take_warm(want)
+            return want, True
+        return want, False
+
+    for slot in warm:
+        if slot not in used and cfg["slot_min"] <= slot <= cfg["slot_max"]:
+            take_warm(slot)
+            return slot, True
+    slot = cfg["slot_min"]
+    while slot in used or slot in warm:
+        slot += 1
+    if slot > cfg["slot_max"]:
+        raise WtError(
+            f"no free slots between {cfg['slot_min']} and {cfg['slot_max']}",
+            hint="remove trees you are done with (wt cleanup --stale), or raise slot_max",
+        )
+    return slot, False
+
+
+def warm_count(db, proj: Project) -> int:
+    return db.execute("SELECT COUNT(*) FROM warm_slots WHERE project = ?", (proj.key,)).fetchone()[0]
+
+
+# --------------------------------------------------------------------------- #
+# Processes, sessions and claims
+# --------------------------------------------------------------------------- #
+
+
+def proc_start(pid: int) -> str | None:
+    """A token identifying one process lifetime, so a reused pid is not mistaken for it."""
+    if pid <= 0:
+        return None
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.parent.parent.joinpath("self").exists():
+        try:
+            text = stat.read_text()
+        except OSError:
+            return None
+        fields = text[text.rindex(")") + 2 :].split()
+        try:
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        except OSError:
+            boot = ""
+        return f"linux:{boot}:{fields[19]}"
+    ps = shutil.which("ps") or ("/bin/ps" if os.access("/bin/ps", os.X_OK) else None)
+    if ps is None:
+        raise WtError("cannot tell whether sessions are alive: no `ps` command found")
+    proc = subprocess.run(
+        [ps, "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"}
+    )
+    out = " ".join(proc.stdout.split())
+    return out or None
+
+
+def alive(pid, start) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    if not start:
+        return True
+    return proc_start(int(pid)) == start
+
+
+@dataclass
+class Session:
+    id: str
+    pid: int
+    start: str
+
+
+def current_session(args, required: bool = False) -> Session | None:
+    sid = getattr(args, "session", None) or os.environ.get("WT_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    pid = getattr(args, "pid", None) or os.environ.get("WT_PID") or os.environ.get("CLAUDE_PID")
+    if not sid or not pid:
+        if required:
+            raise WtError(
+                "no session identity",
+                hint="run inside a Claude session, or pass --session ID --pid PID",
+            )
+        return None
+    try:
+        pid = int(pid)
+    except ValueError as exc:
+        raise WtError(f"session pid {pid!r} is not a number") from exc
+    start = proc_start(pid)
+    if start is None:
+        raise WtError(f"session process {pid} is not running")
+    return Session(sid, pid, start)
+
+
+def session_label(session_id: str | None, pid) -> str | None:
+    """The name Claude shows for a live session, read from its session file if present."""
+    if not session_id or not pid:
+        return None
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    try:
+        data = json.loads((base / "sessions" / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if data.get("sessionId") != session_id:
+        return None
+    name = data.get("name")
+    return name if isinstance(name, str) else None
+
+
+def holder_info(row, sess: Session | None) -> dict:
+    if not row["claim_session"]:
+        return {"state": "none"}
+    live = alive(row["claim_pid"], row["claim_start"])
+    info = {
+        "state": "live" if live else "ended",
+        "session": row["claim_session"],
+        "pid": row["claim_pid"],
+        "claimed_at": row["claimed_at"],
+        "mine": sess is not None and sess.id == row["claim_session"],
+    }
+    if live:
+        info["label"] = session_label(row["claim_session"], row["claim_pid"])
+    return info
+
+
+def describe_holder(h: dict) -> str:
+    if h["state"] == "none":
+        return "-"
+    who = h.get("label") or h["session"][:8]
+    if h.get("mine") and h["state"] == "live":
+        return f"this session ({who})"
+    if h.get("mine"):
+        return f"this session, earlier process ({who})"
+    return f"{who} ({h['state']})"
+
+
+def claim(db, proj: Project, name: str, sess: Session) -> list[str]:
+    """Give `name` to `sess` inside an open transaction; the session's other claims lapse."""
+    stamp = now()
+    released = [
+        r["name"]
+        for r in db.execute(
+            "SELECT name FROM trees WHERE claim_session = ? AND NOT (project = ? AND name = ?)",
+            (sess.id, proj.key, name),
+        )
+    ]
+    db.execute(
+        "UPDATE trees SET claim_session = NULL, claim_pid = NULL, claim_start = NULL,"
+        " claimed_at = NULL, updated_at = ? WHERE claim_session = ? AND NOT (project = ? AND name = ?)",
+        (stamp, sess.id, proj.key, name),
+    )
+    db.execute(
+        "UPDATE trees SET claim_session = ?, claim_pid = ?, claim_start = ?, claimed_at = ?,"
+        " updated_at = ? WHERE project = ? AND name = ?",
+        (sess.id, sess.pid, sess.start, stamp, stamp, proj.key, name),
+    )
+    for other in released:
+        event(db, proj, "released", name=other, session=sess.id, detail=f"session moved to {name}")
+    event(db, proj, "claimed", name=name, session=sess.id, detail=f"pid {sess.pid}")
+    return released
+
+
+def unclaim(db, proj: Project, name: str) -> None:
+    db.execute(
+        "UPDATE trees SET claim_session = NULL, claim_pid = NULL, claim_start = NULL,"
+        " claimed_at = NULL, updated_at = ? WHERE project = ? AND name = ?",
+        (now(), proj.key, name),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Names, branches and stories
+# --------------------------------------------------------------------------- #
+
+
+def slugify(text: str, maxlen: int) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    if len(slug) > maxlen:
+        cut = slug[:maxlen]
+        if slug[maxlen] != "-" and "-" in cut:
+            cut = cut.rsplit("-", 1)[0]
+        slug = cut.strip("-")
+    return slug
+
+
+def name_for_branch(branch: str, cfg: dict) -> str:
+    parts = branch.split("/")
+    if len(parts) > 1 and parts[0] in cfg["branch_types"]:
+        parts = parts[1:]
+    return slugify("-".join(parts), cfg["name_max"])
+
+
+def story_of(text: str | None) -> str | None:
+    if not text:
+        return None
+    match = STORY_RE.search(text)
+    return f"sc-{match.group(1)}" if match else None
+
+
+@dataclass
+class Spec:
+    branch: str
+    name: str
+    story: str | None
+    source: str  # local | remote | new
+    start: str | None = None
+
+
+def local_branches(proj: Project) -> set[str]:
+    out = git(proj.root, "for-each-ref", "--format=%(refname:short)", "refs/heads").stdout
+    return {line for line in out.splitlines() if line}
+
+
+def remote_branches(proj: Project, pattern: str) -> list[str]:
+    proc = git(proj.root, "ls-remote", "--heads", proj.remote, pattern, check=False)
+    if proc.returncode:
+        raise WtError(f"could not list branches on {proj.remote}: {proc.stderr.strip()}")
+    return [
+        line.split("\t", 1)[1].removeprefix("refs/heads/")
+        for line in proc.stdout.splitlines()
+        if "\t" in line
+    ]
+
+
+def lookup_story(proj: Project, story_id: str) -> tuple[str, str]:
+    """(type, title) for a story, via the `short` CLI."""
+    exe = os.environ.get("WT_SHORT") or shutil.which("short")
+    if not exe:
+        raise WtError(
+            f"story sc-{story_id} has no branch yet, and the `short` CLI is not installed to look it up",
+            hint="install short, or create the branch yourself and pass its name",
+        )
+    proc = run([exe, "story", story_id, "-q", "-f", "%y\t%t"], check=False)
+    out = ANSI_RE.sub("", proc.stdout).strip()
+    if proc.returncode or "\t" not in out:
+        detail = ANSI_RE.sub("", proc.stderr).strip() or out or f"exit {proc.returncode}"
+        raise WtError(
+            f"could not look up story sc-{story_id} with short: {detail}",
+            hint="check the story id; pass an existing branch name to skip the lookup",
+        )
+    story_type, title = out.split("\t", 1)
+    return story_type.strip().lower() or proj.config["default_type"], title.strip()
+
+
+def resolve_spec(proj: Project, text: str, story_type: str | None) -> Spec:
+    """Turn what the user asked for into a branch, a name, and how to get the branch."""
+    cfg = proj.config
+    text = text.strip()
+    if not text:
+        raise WtError("say what to work on: a story id, a branch, or a description", code=EXIT_USAGE)
+    local = local_branches(proj)
+    remote_ok = proj.has_remote()
+    plain = not re.search(r"\s", text) and valid_branch_name(proj.root, text)
+
+    # An existing branch, named exactly.
+    if text in local:
+        return Spec(text, name_for_branch(text, cfg), story_of(text), "local")
+    if plain and remote_ok and text in remote_branches(proj, text):
+        return Spec(text, name_for_branch(text, cfg), story_of(text), "remote")
+
+    # A story. Strict: if it cannot be resolved, fail rather than guess.
+    match = STORY_RE.search(text)
+    story_id = match.group(1) if match else (text if re.fullmatch(r"\d{3,}", text) else None)
+    if story_id:
+        story_id = str(int(story_id))
+        owned = re.compile(rf"(?:^|[/-])sc-{story_id}(?:[/-]|$)", re.IGNORECASE)
+        hits = {b for b in local if owned.search(b)}
+        if remote_ok:
+            hits |= {b for b in remote_branches(proj, f"*sc-{story_id}*") if owned.search(b)}
+        if len(hits) > 1:
+            raise WtError(
+                f"several branches belong to sc-{story_id}: {', '.join(sorted(hits))}",
+                hint="pass the branch name instead",
+                branches=sorted(hits),
+            )
+        if hits:
+            branch = hits.pop()
+            return Spec(branch, name_for_branch(branch, cfg), f"sc-{story_id}", "local" if branch in local else "remote")
+        kind, title = lookup_story(proj, story_id)
+        slug = slugify(title, cfg["slug_max"]) or "story"
+        branch = cfg["story_branch"].format(type=story_type or kind, id=story_id, slug=slug)
+        if not valid_branch_name(proj.root, branch):
+            raise WtError(f"story_branch produced an invalid branch name: {branch!r}")
+        return Spec(branch, name_for_branch(branch, cfg), f"sc-{story_id}", "new")
+
+    # Free text, or a new branch name that already carries a type prefix.
+    if plain and "/" in text and text.split("/", 1)[0] in cfg["branch_types"]:
+        branch = text
+    else:
+        slug = slugify(text, cfg["slug_max"])
+        if not slug:
+            raise WtError(f"cannot make a branch name out of {text!r}", code=EXIT_USAGE)
+        branch = f"{story_type or cfg['default_type']}/{slug}"
+    source = "local" if branch in local else "new"
+    return Spec(branch, name_for_branch(branch, cfg), None, source)
+
+
+def resolve_base(proj: Project, explicit: str | None) -> str:
+    cfg = proj.config
+    remote_ok = proj.has_remote()
+    base = explicit or cfg["base"]
+    if not base and remote_ok:
+        proc = git(proj.root, "symbolic-ref", "--short", f"refs/remotes/{proj.remote}/HEAD", check=False)
+        if proc.returncode == 0:
+            base = proc.stdout.strip()
+        else:
+            for candidate in ("main", "master"):
+                ref = f"{proj.remote}/{candidate}"
+                if git(proj.root, "rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0:
+                    base = ref
+                    break
+    if not base:
+        base = "HEAD"
+    if cfg["fetch"] and remote_ok and base.startswith(proj.remote + "/"):
+        try:
+            git_retry(proj.root, "fetch", "--quiet", proj.remote, base[len(proj.remote) + 1 :])
+        except WtError as exc:
+            warn(f"could not fetch {base}; branching from the local copy ({exc.message})")
+    if git(proj.root, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}", check=False).returncode:
+        raise WtError(f"base {base!r} is not a commit")
+    return base
+
+
+def add_worktree(proj: Project, spec: Spec, path: Path) -> None:
+    if spec.source == "local":
+        git_retry(proj.root, "worktree", "add", "--quiet", str(path), spec.branch)
+    elif spec.source == "remote":
+        git_retry(proj.root, "fetch", "--quiet", proj.remote, spec.branch)
+        git_retry(
+            proj.root, "worktree", "add", "--quiet", "--track", "-b", spec.branch,
+            str(path), f"{proj.remote}/{spec.branch}",
+        )
+    else:
+        # --no-track: the base is the start point, not where this branch pushes.
+        git_retry(proj.root, "worktree", "add", "--quiet", "--no-track", "-b", spec.branch, str(path), spec.start)
+
+
+# --------------------------------------------------------------------------- #
+# Hooks
+# --------------------------------------------------------------------------- #
+
+
+@dataclass
+class HookResult:
+    rc: int
+    output: str
+    log: Path
+
+
+def log_dir(proj: Project) -> Path:
+    digest = hashlib.sha1(proj.key.encode()).hexdigest()[:8]
+    path = wt_home() / "logs" / f"{proj.name}-{digest}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def hook_path(proj: Project, hook: str) -> Path | None:
+    path = proj.hooks / hook
+    return path if path.exists() else None
+
+
+def run_hook(proj: Project, hook: str, *, env: dict, cwd: Path, label: str, stream: bool = False) -> HookResult | None:
+    path = hook_path(proj, hook)
+    if path is None:
+        return None
+    if not os.access(path, os.X_OK):
+        raise WtError(f"{path} is not executable", hint=f"chmod +x {path}")
+    full_env = {k: v for k, v in os.environ.items() if not k.startswith("WT_") or k == "WT_HOME"}
+    full_env.update(env)
+    log = log_dir(proj) / f"{label}.{hook}.log"
+    lines: list[str] = []
+    with open(log, "w", encoding="utf-8") as fh:
+        fh.write(f"# {now()} {path} (cwd {cwd})\n")
+        fh.flush()
+        proc = subprocess.Popen(
+            [str(path)], cwd=cwd, env=full_env, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            fh.write(line)
+            lines.append(line)
+            if stream:
+                sys.stderr.write(line)
+        rc = proc.wait()
+        fh.write(f"# exit {rc}\n")
+    return HookResult(rc, "".join(lines), log)
+
+
+def tail(text: str, n: int = 30) -> str:
+    return "\n".join(text.rstrip("\n").splitlines()[-n:])
+
+
+def core_env(proj: Project, name: str, path, branch, slot) -> dict:
+    return {
+        "WT_PROJECT": proj.name,
+        "WT_ROOT": str(proj.root),
+        "WT_GIT_COMMON_DIR": proj.key,
+        "WT_NAME": name or "",
+        "WT_PATH": str(path or ""),
+        "WT_BRANCH": branch or "",
+        "WT_SLOT": str(slot),
+    }
+
+
+def stored_env(row) -> dict:
+    try:
+        env = json.loads(row["env_json"] or "{}")
+    except ValueError:
+        return {}
+    return env if isinstance(env, dict) else {}
+
+
+def tree_env(proj: Project, row) -> dict:
+    """What a command run in the tree should see: the setup output, then wt's own variables."""
+    env = {k: str(v) for k, v in stored_env(row).items()}
+    env.update(core_env(proj, row["name"], row["path"], row["branch"], row["slot"]))
+    return env
+
+
+def parse_env_output(text: str) -> dict:
+    env: dict[str, str] = {}
+    for number, line in enumerate(text.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        if not sep or not ENV_KEY_RE.match(key):
+            raise ValueError(f"line {number} is not KEY=VALUE: {line!r}")
+        if key.startswith("WT_"):
+            raise ValueError(f"line {number}: WT_* variables are reserved for wt ({key})")
+        env[key] = value
+    return env
+
+
+def run_setup(db, proj: Project, name: str, args) -> dict:
+    """Run the setup hook for a row already marked setting_up by this process."""
+    row = get_row(db, proj, name)
+    path = Path(row["path"])
+    fd, env_out = tempfile.mkstemp(prefix="env-", suffix=".out", dir=log_dir(proj))
+    os.close(fd)
+    try:
+        env = core_env(proj, name, path, row["branch"], row["slot"])
+        env["WT_SLOT_WARM"] = "1" if row["slot_warm"] else "0"
+        env["WT_ENV_OUT"] = env_out
+        result = run_hook(proj, "setup", env=env, cwd=path, label=name, stream=getattr(args, "verbose", False))
+        produced: dict = {}
+        error = None
+        if result is not None and result.rc != 0:
+            error = f"setup exited {result.rc}; log: {result.log}"
+        elif result is not None:
+            try:
+                produced = parse_env_output(Path(env_out).read_text(encoding="utf-8"))
+            except ValueError as exc:
+                error = f"setup wrote bad output to WT_ENV_OUT: {exc}; log: {result.log}"
+    finally:
+        Path(env_out).unlink(missing_ok=True)
+    with txn(db):
+        if error:
+            set_state(db, proj, name, "broken", error=error)
+            event(db, proj, "setup_failed", name=name, slot=row["slot"], detail=error)
+        else:
+            set_state(db, proj, name, "ready", env_json=json.dumps(produced, sort_keys=True))
+            event(db, proj, "setup_ok", name=name, slot=row["slot"])
+    if error:
+        assert result is not None
+        if not getattr(args, "verbose", False) and not args.json:
+            print(tail(result.output), file=sys.stderr)
+        raise WtError(
+            error,
+            hint=f"fix it and run `wt setup {name}`, or remove the tree with `wt rm {name} --yes`",
+            name=name, path=str(path), log=str(result.log),
+        )
+    return {"ran": result is not None, "log": str(result.log) if result else None}
+
+
+# --------------------------------------------------------------------------- #
+# Shared helpers for commands
+# --------------------------------------------------------------------------- #
+
+
+def emit(args, data, text: str | None = None) -> None:
+    if args.json:
+        if WARNINGS and isinstance(data, dict):
+            data = {**data, "warnings": WARNINGS}
+        print(json.dumps(data, indent=2, default=str))
+    elif text:
+        print(text)
+
+
+def branch_by_path(proj: Project) -> dict[str, dict]:
+    try:
+        return {wt["path"]: wt for wt in parse_worktrees(proj.root)}
+    except WtError:
+        return {}
+
+
+def describe_tree(proj: Project, row, sess: Session | None, worktrees=None) -> dict:
+    worktrees = worktrees if worktrees is not None else branch_by_path(proj)
+    wt = worktrees.get(row["path"])
+    return {
+        "project": proj.name,
+        "root": str(proj.root),
+        "name": row["name"],
+        "path": row["path"],
+        "exists": Path(row["path"]).is_dir(),
+        "branch": (wt or {}).get("branch") or row["branch"],
+        "story": row["story"],
+        "slot": row["slot"],
+        "slot_warm": bool(row["slot_warm"]),
+        "state": row["state"],
+        "last_error": row["last_error"],
+        "holder": holder_info(row, sess),
+        "env": tree_env(proj, row),
+        "created_at": row["created_at"],
+    }
+
+
+def resolve_row(db, proj: Project, name: str | None, sess: Session | None):
+    """A tree by name or path; with no name, the tree containing cwd, then the session's own."""
+    if name:
+        row = get_row(db, proj, name)
+        if row:
+            return row
+        real = os.path.realpath(name)
+        row = db.execute("SELECT * FROM trees WHERE project = ? AND path = ?", (proj.key, real)).fetchone()
+        if row:
+            return row
+        raise WtError(f"no tree named {name!r} in {proj.name}", hint="wt list")
+    cwd = os.path.realpath(os.getcwd())
+    for row in project_rows(db, proj):
+        if cwd == row["path"] or cwd.startswith(row["path"] + os.sep):
+            return row
+    if sess:
+        row = db.execute(
+            "SELECT * FROM trees WHERE project = ? AND claim_session = ?", (proj.key, sess.id)
+        ).fetchone()
+        if row:
+            return row
+    raise WtError(
+        "no tree given, and none could be inferred from the working directory or this session",
+        code=EXIT_USAGE,
+        hint="pass a tree name; `wt list` shows them",
+    )
+
+
+def check_name(name: str) -> str:
+    if not NAME_RE.match(name):
+        raise WtError(f"{name!r} is not a usable tree name (lowercase letters, digits, . _ -)", code=EXIT_USAGE)
+    return name
+
+
+def tree_summary(info: dict) -> str:
+    lines = [f"{info['name']}  slot {info['slot']}  {info['state']}  {info['branch'] or '(detached)'}"]
+    lines.append(f"  path:   {info['path']}")
+    lines.append(f"  holder: {describe_holder(info['holder'])}")
+    extra = {k: v for k, v in info["env"].items() if not k.startswith("WT_")}
+    if extra:
+        lines.append("  env:    " + " ".join(f"{k}={shlex.quote(v)}" for k, v in sorted(extra.items())))
+    if info["last_error"]:
+        lines.append(f"  error:  {info['last_error']}")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Commands: creating and holding trees
+# --------------------------------------------------------------------------- #
+
+
+def cmd_new(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args)
+    spec = resolve_spec(proj, " ".join(args.spec), args.type)
+    name = check_name(args.name or spec.name)
+    path = proj.trees_dir / name
+
+    if spec.source == "local":
+        for wt in parse_worktrees(proj.root):
+            if wt.get("branch") == spec.branch:
+                taken = db.execute(
+                    "SELECT name FROM trees WHERE project = ? AND path = ?", (proj.key, wt["path"])
+                ).fetchone()
+                hint = f"wt claim {taken[0]}" if taken else f"wt adopt {wt['path']}"
+                raise WtError(f"branch {spec.branch} is already checked out at {wt['path']}", hint=hint)
+    if path.exists():
+        raise WtError(f"{path} already exists", hint=f"register it with `wt adopt {path}`")
+    if spec.source == "new":
+        spec.start = resolve_base(proj, args.base)
+
+    with txn(db):
+        if get_row(db, proj, name):
+            raise WtError(f"a tree named {name} is already registered", hint=f"wt claim {name}")
+        slot, warm = allocate_slot(db, proj)
+        stamp = now()
+        db.execute(
+            "INSERT INTO trees (project, name, root, path, branch, story, slot, slot_warm, state,"
+            " op_pid, op_start, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                proj.key, name, str(proj.root), str(path), spec.branch, spec.story, slot, int(warm),
+                "setting_up", os.getpid(), proc_start(os.getpid()), stamp, stamp,
+            ),
+        )
+        event(db, proj, "created", name=name, slot=slot, session=sess.id if sess else None,
+              detail=f"{spec.branch} ({spec.source})")
+        if sess:
+            claim(db, proj, name, sess)
+
+    try:
+        add_worktree(proj, spec, path)
+    except BaseException:
+        with txn(db):
+            db.execute("DELETE FROM trees WHERE project = ? AND name = ?", (proj.key, name))
+            if warm:
+                db.execute(
+                    "INSERT OR REPLACE INTO warm_slots (project, slot, released_at) VALUES (?,?,?)",
+                    (proj.key, slot, now()),
+                )
+            event(db, proj, "create_failed", name=name, slot=slot)
+        raise
+
+    setup = run_setup(db, proj, name, args)
+    info = describe_tree(proj, get_row(db, proj, name), sess)
+    info["created_branch"] = spec.source == "new"
+    info["setup"] = setup
+    reused = ", warm resources reused" if warm else ""
+    text = [f"Created {name} on {info['branch']} (slot {slot}{reused})", tree_summary(info)]
+    if not sess:
+        text.append("Not claimed: no session identity (pass --session/--pid to claim).")
+    text.append("Run commands in it with `wt exec -- <command>`, or cd into the path.")
+    emit(args, info, "\n".join(text))
+    return EXIT_OK
+
+
+def cmd_adopt(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args)
+    path = os.path.realpath(args.path)
+    worktrees = branch_by_path(proj)
+    wt = worktrees.get(path)
+    if wt is None:
+        raise WtError(f"{path} is not a worktree of {proj.root}")
+    if path == str(proj.root):
+        raise WtError("the root checkout cannot be adopted")
+    name = check_name(args.name or (Path(path).name if NAME_RE.match(Path(path).name) else slugify(Path(path).name, proj.config["name_max"])))
+    branch = wt.get("branch")
+
+    with txn(db):
+        if get_row(db, proj, name):
+            raise WtError(f"a tree named {name} is already registered")
+        if db.execute("SELECT 1 FROM trees WHERE project = ? AND path = ?", (proj.key, path)).fetchone():
+            raise WtError(f"{path} is already registered")
+        slot, warm = allocate_slot(db, proj, args.slot)
+        stamp = now()
+        state = "ready" if args.no_setup else "setting_up"
+        db.execute(
+            "INSERT INTO trees (project, name, root, path, branch, story, slot, slot_warm, state,"
+            " op_pid, op_start, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                proj.key, name, str(proj.root), path, branch, story_of(branch), slot, int(warm or args.warm),
+                state, None if args.no_setup else os.getpid(),
+                None if args.no_setup else proc_start(os.getpid()), stamp, stamp,
+            ),
+        )
+        event(db, proj, "adopted", name=name, slot=slot, session=sess.id if sess else None, detail=path)
+        if args.claim:
+            claim(db, proj, name, current_session(args, required=True))
+
+    setup = None if args.no_setup else run_setup(db, proj, name, args)
+    info = describe_tree(proj, get_row(db, proj, name), sess)
+    info["setup"] = setup
+    emit(args, info, f"Adopted {name} (slot {slot})\n" + tree_summary(info))
+    return EXIT_OK
+
+
+def cmd_setup(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args)
+    with txn(db):
+        row = resolve_row(db, proj, args.name, sess)
+        name = row["name"]
+        if row["state"] in ("setting_up", "tearing_down") and alive(row["op_pid"], row["op_start"]):
+            raise WtError(f"{name} is busy: wt process {row['op_pid']} is running {row['state']}")
+        h = holder_info(row, sess)
+        if h["state"] == "live" and not h["mine"]:
+            raise WtError(f"{name} is held by another live session ({describe_holder(h)})", code=EXIT_HELD)
+        if not Path(row["path"]).is_dir():
+            raise WtError(f"{row['path']} does not exist", hint=f"wt rm {name} --yes")
+        set_state(db, proj, name, "setting_up", op=True)
+        event(db, proj, "setup_rerun", name=name, slot=row["slot"], session=sess.id if sess else None)
+    setup = run_setup(db, proj, name, args)
+    info = describe_tree(proj, get_row(db, proj, name), sess)
+    info["setup"] = setup
+    emit(args, info, f"Set up {name} again\n" + tree_summary(info))
+    return EXIT_OK
+
+
+def cmd_claim(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args, required=True)
+    with txn(db):
+        row = resolve_row(db, proj, args.name, None)
+        name = row["name"]
+        if row["state"] == "tearing_down" and alive(row["op_pid"], row["op_start"]):
+            raise WtError(f"{name} is being removed")
+        h = holder_info(row, sess)
+        if h["state"] != "none" and not h["mine"]:
+            if h["state"] == "live":
+                raise WtError(
+                    f"{name} is held by another session that is still running: {describe_holder(h)}",
+                    code=EXIT_HELD, holder=h,
+                )
+            if not args.take_over:
+                raise WtError(
+                    f"{name} was last used by session {h['session']}, which has ended",
+                    code=EXIT_CONFIRM, holder=h,
+                    hint=f"confirm with the user, then run `wt claim {name} --take-over`",
+                )
+        released = claim(db, proj, name, sess)
+    info = describe_tree(proj, get_row(db, proj, name), sess)
+    info["released"] = released
+    text = f"Claimed {name}" + (f" (released {', '.join(released)})" if released else "")
+    emit(args, info, text + "\n" + tree_summary(info))
+    return EXIT_OK
+
+
+def cmd_release(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args)
+    with txn(db):
+        row = resolve_row(db, proj, args.name, sess)
+        h = holder_info(row, sess)
+        if h["state"] == "live" and not h["mine"] and not args.force:
+            raise WtError(f"{row['name']} is held by another live session ({describe_holder(h)})",
+                          code=EXIT_HELD, hint="pass --force to release it anyway")
+        unclaim(db, proj, row["name"])
+        event(db, proj, "released", name=row["name"], session=sess.id if sess else None)
+    emit(args, {"name": row["name"], "released": True}, f"Released {row['name']}")
+    return EXIT_OK
+
+
+def cmd_env(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    row = resolve_row(db, proj, args.name, current_session(args))
+    env = tree_env(proj, row)
+    emit(args, env, "\n".join(f"export {k}={shlex.quote(v)}" for k, v in sorted(env.items())))
+    return EXIT_OK
+
+
+def cmd_exec(args) -> int:
+    rest = list(args.rest)
+    if "--" in rest:
+        cut = rest.index("--")
+        names, command = rest[:cut], rest[cut + 1 :]
+    else:
+        names, command = [], rest
+    if len(names) > 1:
+        raise WtError("usage: wt exec [NAME] -- COMMAND...", code=EXIT_USAGE)
+    if not command:
+        raise WtError("no command given: wt exec [NAME] -- COMMAND...", code=EXIT_USAGE)
+    proj = load_project(args.C)
+    db = open_db()
+    row = resolve_row(db, proj, names[0] if names else None, current_session(args))
+    db.close()
+    if not Path(row["path"]).is_dir():
+        raise WtError(f"{row['path']} does not exist", hint=f"wt rm {row['name']} --yes")
+    env = dict(os.environ)
+    env.update(tree_env(proj, row))
+    os.chdir(row["path"])
+    env["PWD"] = row["path"]
+    try:
+        os.execvpe(command[0], command, env)
+    except FileNotFoundError as exc:
+        raise WtError(f"{command[0]}: command not found", code=127) from exc
+    return EXIT_OK  # unreachable
+
+
+# --------------------------------------------------------------------------- #
+# Commands: looking
+# --------------------------------------------------------------------------- #
+
+
+def unregistered(proj: Project, rows) -> tuple[list[dict], list[dict]]:
+    """Worktrees under worktrees_dir without a row: (unregistered, unmanaged)."""
+    known = {r["path"] for r in rows}
+    trees_dir = str(proj.trees_dir)
+    loose, unmanaged = [], []
+    for wt in parse_worktrees(proj.root)[1:]:
+        if wt["path"] in known or not wt["path"].startswith(trees_dir + os.sep):
+            continue
+        base = Path(wt["path"]).name
+        entry = {"name": base, "path": wt["path"], "branch": wt.get("branch"), "prunable": bool(wt.get("prunable"))}
+        if any(fnmatch.fnmatch(base, pattern) for pattern in proj.config["unmanaged"]):
+            unmanaged.append(entry)
+        else:
+            loose.append(entry)
+    return loose, unmanaged
+
+
+def table(rows: list[list[str]], indent: str = "  ") -> str:
+    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
+    return "\n".join(
+        indent + "  ".join(cell.ljust(widths[i]) for i, cell in enumerate(r)).rstrip() for r in rows
+    )
+
+
+def cmd_list(args) -> int:
+    db = open_db()
+    sess = current_session(args)
+    if args.all_projects:
+        keys = [r[0] for r in db.execute("SELECT DISTINCT project FROM trees ORDER BY root")]
+        projects = []
+        for key in keys:
+            root = db.execute("SELECT root FROM trees WHERE project = ? LIMIT 1", (key,)).fetchone()[0]
+            try:
+                projects.append(load_project(root))
+            except WtError:
+                projects.append(Project(key=key, root=Path(root), config=copy.deepcopy(DEFAULTS)))
+    else:
+        projects = [load_project(args.C)]
+
+    result, text = [], []
+    for proj in projects:
+        rows = project_rows(db, proj)
+        worktrees = branch_by_path(proj)
+        trees = [describe_tree(proj, row, sess, worktrees) for row in rows]
+        try:
+            _, unmanaged = unregistered(proj, rows)
+        except WtError:
+            unmanaged = []
+        result.append({"project": proj.name, "root": str(proj.root), "trees": trees,
+                       "unmanaged": [u["name"] for u in unmanaged]})
+        text.append(f"{proj.name}  ({proj.root})")
+        if trees:
+            grid = [["NAME", "SLOT", "STATE", "BRANCH", "HELD BY"]]
+            for t in trees:
+                state = t["state"] if t["exists"] else f"{t['state']}, missing"
+                grid.append([t["name"], str(t["slot"]), state, t["branch"] or "-", describe_holder(t["holder"])])
+            text.append(table(grid))
+        else:
+            text.append("  no trees")
+        if unmanaged:
+            text.append(f"  unmanaged: {', '.join(u['name'] for u in unmanaged)}")
+    emit(args, result if args.all_projects else result[0], "\n".join(text))
+    return EXIT_OK
+
+
+def find_anomalies(db, proj: Project, sess: Session | None, inventory: bool) -> list[dict]:
+    found: list[dict] = []
+
+    def add(kind: str, subject: str, detail: str, fix: str) -> None:
+        found.append({"kind": kind, "subject": subject, "detail": detail, "fix": fix})
+
+    rows = project_rows(db, proj)
+    for row in rows:
+        name = row["name"]
+        if not Path(row["path"]).is_dir():
+            add("ORPHANED", name, f"registered, but {row['path']} is gone", f"wt rm {name} --yes")
+        busy = row["state"] in ("setting_up", "tearing_down")
+        if busy and not alive(row["op_pid"], row["op_start"]):
+            fix = f"wt setup {name}" if row["state"] == "setting_up" else f"wt rm {name}"
+            add("STUCK", name, f"{row['state']} was interrupted (wt process {row['op_pid']} is gone)",
+                f"{fix}, or `wt rm {name}`" if row["state"] == "setting_up" else fix)
+        if row["state"] == "broken":
+            add("BROKEN", name, row["last_error"] or "a hook failed", f"wt setup {name}, or `wt rm {name}`")
+        h = holder_info(row, sess)
+        if h["state"] == "ended" and not h["mine"]:
+            add("STALE", name, f"held by session {h['session'][:8]}, which has ended", "wt cleanup --stale")
+
+    try:
+        loose, _ = unregistered(proj, rows)
+    except WtError:
+        loose = []
+    for entry in loose:
+        if entry["prunable"]:
+            add("PRUNABLE", entry["name"], "git still lists a worktree whose directory is gone", "git worktree prune")
+        else:
+            add("UNREGISTERED", entry["name"], f"worktree at {entry['path']} has no registry row",
+                f"wt adopt {entry['path']}")
+
+    if inventory and hook_path(proj, "inventory"):
+        result = run_hook(proj, "inventory", env=core_env(proj, "", "", "", ""), cwd=proj.root, label="project")
+        slots: set[int] = set()
+        bad = result.rc != 0
+        if not bad:
+            for line in result.output.split():
+                if line.isdigit():
+                    slots.add(int(line))
+                else:
+                    bad = True
+        if bad:
+            add("UNKNOWN", "inventory", f"inventory failed, so leaked resources are unknown; log: {result.log}",
+                "fix .claude/worktree/inventory")
+        else:
+            used = {row["slot"] for row in rows}
+            warm = {r[0] for r in db.execute("SELECT slot FROM warm_slots WHERE project = ?", (proj.key,))}
+            for slot in sorted(slots - used - warm):
+                add("LEAKED", f"slot {slot}", "resources exist but no tree uses this slot",
+                    f"wt slots purge {slot} --yes (or `wt slots warm {slot}` to keep them)")
+            for slot in sorted(warm - slots):
+                add("COLD", f"slot {slot}", "recorded as warm, but inventory finds no resources",
+                    f"wt slots purge {slot} --yes")
+    return found
+
+
+def cmd_status(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    found = find_anomalies(db, proj, current_session(args), inventory=not args.no_inventory)
+    if not found:
+        emit(args, {"project": proj.name, "anomalies": []}, f"{proj.name}: nothing to fix")
+        return EXIT_OK
+    grid = [["KIND", "SUBJECT", "DETAIL"]] + [[a["kind"], a["subject"], a["detail"]] for a in found]
+    fixes = "\n".join(f"  {a['subject']}: {a['fix']}" for a in found)
+    emit(args, {"project": proj.name, "anomalies": found},
+         f"{proj.name}: {len(found)} to look at\n{table(grid)}\nFixes:\n{fixes}")
+    return EXIT_OK
+
+
+def cmd_janitor(args) -> int:
+    """Quiet summary for a SessionStart hook. Never fails the session."""
+    try:
+        proj = load_project(args.C)
+        db = open_db()
+        hook_session = None
+        if args.hook and not sys.stdin.isatty():
+            try:
+                hook_session = json.loads(sys.stdin.read() or "{}").get("session_id")
+            except ValueError:
+                pass
+        sess = current_session(args)
+        found = find_anomalies(db, proj, sess, inventory=False)
+        lines = []
+        session_id = hook_session or (sess.id if sess else None)
+        if session_id:
+            mine = db.execute("SELECT name, path FROM trees WHERE project = ? AND claim_session = ?",
+                              (proj.key, session_id)).fetchone()
+            if mine:
+                lines.append(f"wt: this session holds tree {mine['name']} at {mine['path']};"
+                             f" run `wt claim {mine['name']}` to keep it, and `wt exec -- <cmd>` to work in it.")
+        stale = [a for a in found if a["kind"] == "STALE"]
+        other = [a for a in found if a["kind"] != "STALE"]
+        if stale:
+            lines.append(f"wt: {len(stale)} tree(s) held by ended sessions: "
+                         f"{', '.join(a['subject'] for a in stale)} (wt cleanup --stale)")
+        if other:
+            lines.append(f"wt: {len(other)} registry problem(s): "
+                         f"{', '.join(a['kind'] + ' ' + a['subject'] for a in other)} (wt status)")
+        if args.json:
+            print(json.dumps({"messages": lines, "anomalies": found}, indent=2))
+        elif lines:
+            print("\n".join(lines))
+    except Exception as exc:  # noqa: BLE001 - a janitor must never break session start
+        if args.json:
+            print(json.dumps({"messages": [], "error": str(exc)}))
+    return EXIT_OK
+
+
+def cmd_log(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    query = "SELECT * FROM events WHERE project = ?"
+    params: list = [proj.key]
+    if args.name:
+        query += " AND name = ?"
+        params.append(args.name)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(args.limit)
+    events = [dict(r) for r in db.execute(query, params).fetchall()][::-1]
+    lines = [
+        f"{e['at']}  {e['kind']:<14} {e['name'] or ''}"
+        + (f"  slot {e['slot']}" if e["slot"] is not None else "")
+        + (f"  [{e['session'][:8]}]" if e["session"] else "")
+        + (f"  {e['detail']}" if e["detail"] else "")
+        for e in events
+    ]
+    emit(args, events, "\n".join(lines) or "no events")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Commands: removing
+# --------------------------------------------------------------------------- #
+
+
+def pr_info(proj: Project, branch: str) -> tuple[dict | None, str | None]:
+    exe = os.environ.get("WT_GH") or shutil.which("gh")
+    if not exe:
+        return None, "gh is not installed, so PR state is unknown"
+    proc = run([exe, "pr", "view", branch, "--json", "number,state,url,headRefOid"], cwd=proj.root, check=False,
+               env={**os.environ, "GH_PROMPT_DISABLED": "1"})
+    if proc.returncode:
+        message = (proc.stderr or proc.stdout).strip()
+        if "no pull requests found" in message.lower():
+            return None, None
+        return None, f"could not read PR state: {message.splitlines()[0] if message else proc.returncode}"
+    try:
+        return json.loads(proc.stdout), None
+    except ValueError:
+        return None, "gh returned something that is not JSON"
+
+
+def removal_mode(db, proj: Project, destroy: bool, pending_warm: int = 0) -> str:
+    limit = proj.config["warm_slots"]
+    if destroy or limit == 0:
+        return "destroy"
+    return "release" if warm_count(db, proj) + pending_warm < limit else "destroy"
+
+
+def plan_removal(db, proj: Project, row, sess: Session | None, args, pending_warm: int = 0) -> dict:
+    name = row["name"]
+    path = Path(row["path"])
+    worktrees = branch_by_path(proj)
+    branch = (worktrees.get(row["path"]) or {}).get("branch") or row["branch"]
+    plan: dict = {
+        "name": name, "slot": row["slot"], "path": row["path"], "branch": branch,
+        "exists": path.is_dir(), "state": row["state"], "holder": holder_info(row, sess),
+        "blocked": [], "notes": [], "dirty": [], "unpushed": 0, "pr": None,
+    }
+    h = plan["holder"]
+    if h["state"] == "live" and not h["mine"]:
+        plan["blocked"].append(f"held by another live session ({describe_holder(h)})")
+    if row["state"] in ("setting_up", "tearing_down") and alive(row["op_pid"], row["op_start"]):
+        plan["blocked"].append(f"wt process {row['op_pid']} is still running {row['state']}")
+
+    head = None
+    if plan["exists"]:
+        status = git(path, "status", "--porcelain=v1", "--untracked-files=normal", check=False)
+        plan["dirty"] = status.stdout.splitlines()
+        head = git(path, "rev-parse", "HEAD", check=False).stdout.strip() or None
+        upstream = git(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", check=False)
+        if upstream.returncode == 0:
+            count = git(path, "rev-list", "--count", "@{u}..HEAD", check=False)
+        else:
+            count = git(path, "rev-list", "--count", "HEAD", "--not", f"--remotes={proj.remote}", check=False)
+        plan["unpushed"] = int(count.stdout.strip() or 0) if count.returncode == 0 else 0
+    else:
+        plan["notes"].append("the directory is gone; teardown runs from the root checkout")
+
+    merged = False
+    if branch and not getattr(args, "no_pr", False):
+        pr, note = pr_info(proj, branch)
+        plan["pr"] = pr
+        if note:
+            plan["notes"].append(note)
+        if pr and pr.get("state") == "MERGED":
+            merged = head is None or pr.get("headRefOid") == head
+            if not merged:
+                plan["notes"].append("the PR is merged, but this branch has commits the PR does not")
+    plan["merged"] = merged
+
+    force = getattr(args, "force", False)
+    if plan["dirty"] and not force:
+        plan["blocked"].append(f"{len(plan['dirty'])} uncommitted change(s)")
+    if plan["unpushed"] and not merged and not force:
+        plan["blocked"].append(f"{plan['unpushed']} commit(s) not pushed to {proj.remote}")
+
+    plan["mode"] = removal_mode(db, proj, getattr(args, "destroy", False), pending_warm)
+    plan["teardown"] = None
+    if getattr(args, "skip_teardown", False):
+        plan["notes"].append("teardown skipped: the slot's resources are left as they are")
+        plan["mode"] = "destroy"
+    elif hook_path(proj, "teardown"):
+        env = {**stored_env(row), **core_env(proj, name, row["path"], branch, row["slot"]),
+               "WT_TEARDOWN_MODE": plan["mode"], "WT_DRY_RUN": "1"}
+        result = run_hook(proj, "teardown", env=env, cwd=path if plan["exists"] else proj.root, label=name)
+        plan["teardown"] = {"rc": result.rc, "output": result.output, "log": str(result.log)}
+        if result.rc != 0:
+            plan["blocked"].append(f"teardown is not sure it can clean up (dry run exited {result.rc})")
+
+    if not branch:
+        action = None
+    elif getattr(args, "keep_branch", False):
+        action = None
+    elif getattr(args, "force_delete_branch", False):
+        action = "-D"
+    elif merged:
+        action = "-D"
+        plan["notes"].append("branch deleted because its PR is merged")
+    elif getattr(args, "delete_branch", False):
+        action = "-d"
+    else:
+        action = None
+    plan["branch_action"] = action
+    return plan
+
+
+def render_plan(plan: dict) -> str:
+    lines = [f"{plan['name']}  (slot {plan['slot']}, {plan['path']})"]
+    lines.append(f"  holder:   {describe_holder(plan['holder'])}")
+    if plan["exists"]:
+        state = f"{len(plan['dirty'])} uncommitted change(s)" if plan["dirty"] else "clean"
+        lines.append(f"  worktree: {state}; {plan['unpushed']} unpushed commit(s)")
+        lines.extend(f"              {line}" for line in plan["dirty"][:10])
+        if len(plan["dirty"]) > 10:
+            lines.append(f"              ... and {len(plan['dirty']) - 10} more")
+    else:
+        lines.append("  worktree: directory is gone")
+    if plan["pr"]:
+        pr = plan["pr"]
+        lines.append(f"  PR:       #{pr.get('number')} {pr.get('state')} {pr.get('url')}")
+    mode = {"release": "release (the slot stays warm for the next tree)", "destroy": "destroy"}[plan["mode"]]
+    lines.append(f"  teardown: {mode}" + ("" if plan["teardown"] is not None else " (no teardown hook)"))
+    if plan["teardown"]:
+        lines.extend(f"    | {line}" for line in plan["teardown"]["output"].rstrip("\n").splitlines())
+    action = {None: "keep", "-d": "delete if merged (git branch -d)", "-D": "delete (git branch -D)"}
+    if plan["branch"]:
+        lines.append(f"  branch:   {action[plan['branch_action']]} {plan['branch']}")
+    lines.extend(f"  note:     {note}" for note in plan["notes"])
+    lines.extend(f"  BLOCKED:  {reason}" for reason in plan["blocked"])
+    return "\n".join(line for line in lines if line)
+
+
+def apply_removal(db, proj: Project, plan: dict, args, sess: Session | None) -> dict:
+    name = plan["name"]
+    with txn(db):
+        row = get_row(db, proj, name)
+        if row is None:
+            raise WtError(f"{name} disappeared from the registry")
+        h = holder_info(row, sess)
+        if h["state"] == "live" and not h["mine"]:
+            raise WtError(f"{name} was claimed by a live session in the meantime", code=EXIT_HELD)
+        if row["state"] in ("setting_up", "tearing_down") and alive(row["op_pid"], row["op_start"]):
+            raise WtError(f"{name} is busy")
+        set_state(db, proj, name, "tearing_down", op=True)
+        event(db, proj, "removing", name=name, slot=row["slot"], session=sess.id if sess else None,
+              detail=plan["mode"])
+    mode = removal_mode(db, proj, getattr(args, "destroy", False))
+    if getattr(args, "skip_teardown", False):
+        mode = "destroy"
+    exists = Path(row["path"]).is_dir()
+
+    def fail(message: str, code: int = EXIT_ERROR):
+        with txn(db):
+            set_state(db, proj, name, "broken", error=message)
+            event(db, proj, "remove_failed", name=name, slot=row["slot"], detail=message)
+        raise WtError(message, code=code, hint=f"fix it and run `wt rm {name} --yes` again")
+
+    if not getattr(args, "skip_teardown", False) and hook_path(proj, "teardown"):
+        env = {**stored_env(row), **core_env(proj, name, row["path"], plan["branch"], row["slot"]),
+               "WT_TEARDOWN_MODE": mode, "WT_DRY_RUN": "0"}
+        result = run_hook(proj, "teardown", env=env, cwd=Path(row["path"]) if exists else proj.root,
+                          label=name, stream=getattr(args, "verbose", False))
+        if result.rc != 0:
+            if not args.json and not getattr(args, "verbose", False):
+                print(tail(result.output), file=sys.stderr)
+            fail(f"teardown exited {result.rc}; log: {result.log}", EXIT_REFUSED)
+
+    if exists:
+        remove = ["worktree", "remove"] + (["--force"] if getattr(args, "force", False) else []) + [row["path"]]
+        proc = git(proj.root, *remove, check=False)
+        if proc.returncode:
+            fail(f"git worktree remove failed: {proc.stderr.strip()}")
+    git(proj.root, "worktree", "prune", check=False)
+
+    branch_result = None
+    if plan["branch_action"] and plan["branch"]:
+        proc = git(proj.root, "branch", plan["branch_action"], plan["branch"], check=False)
+        branch_result = "deleted" if proc.returncode == 0 else f"kept: {proc.stderr.strip()}"
+
+    with txn(db):
+        db.execute("DELETE FROM trees WHERE project = ? AND name = ?", (proj.key, name))
+        if mode == "release":
+            db.execute("INSERT OR REPLACE INTO warm_slots (project, slot, released_at) VALUES (?,?,?)",
+                       (proj.key, row["slot"], now()))
+        else:
+            db.execute("DELETE FROM warm_slots WHERE project = ? AND slot = ?", (proj.key, row["slot"]))
+        event(db, proj, "removed", name=name, slot=row["slot"], session=sess.id if sess else None,
+              detail=f"{mode}; branch {branch_result or 'kept'}")
+    return {"name": name, "mode": mode, "branch": plan["branch"], "branch_result": branch_result or "kept"}
+
+
+def cmd_rm(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args)
+    row = get_row(db, proj, args.name)
+    if row is None:
+        raise WtError(f"no tree named {args.name!r} in {proj.name}", hint="wt list")
+    plan = plan_removal(db, proj, row, sess, args)
+    if plan["blocked"]:
+        held = plan["holder"]["state"] == "live" and not plan["holder"]["mine"]
+        emit(args, {"applied": False, "plan": plan}, render_plan(plan) + "\nNot removed.")
+        return EXIT_HELD if held else EXIT_REFUSED
+    if not args.yes:
+        emit(args, {"applied": False, "plan": plan}, render_plan(plan) + "\nDry run. Re-run with --yes to apply.")
+        return EXIT_OK
+    if not args.json:
+        print(render_plan(plan))
+    done = apply_removal(db, proj, plan, args, sess)
+    emit(args, {"applied": True, "plan": plan, "result": done},
+         f"Removed {done['name']} ({done['mode']}); branch {done['branch_result']}.")
+    return EXIT_OK
+
+
+def cmd_cleanup(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    sess = current_session(args)
+    candidates = []
+    for row in project_rows(db, proj):
+        h = holder_info(row, sess)
+        if h["state"] == "ended" and not h["mine"]:
+            candidates.append(row)
+        elif h["state"] == "none" and args.include_unclaimed:
+            candidates.append(row)
+    if not candidates:
+        emit(args, {"applied": False, "plans": [], "removed": []}, "Nothing stale to clean up.")
+        return EXIT_OK
+    plans, pending = [], 0
+    for row in candidates:
+        plan = plan_removal(db, proj, row, sess, args, pending_warm=pending)
+        if not plan["blocked"] and plan["mode"] == "release":
+            pending += 1
+        plans.append(plan)
+    ready = [p for p in plans if not p["blocked"]]
+    skipped = [p for p in plans if p["blocked"]]
+    text = "\n\n".join(render_plan(p) for p in plans)
+    summary = f"\n\n{len(ready)} to remove, {len(skipped)} skipped."
+    if not args.yes:
+        emit(args, {"applied": False, "plans": plans, "removed": []},
+             text + summary + (" Re-run with --yes to apply." if ready else ""))
+        return EXIT_OK
+    if not args.json:
+        print(text + summary)
+    removed, failed = [], []
+    for plan in ready:
+        try:
+            removed.append(apply_removal(db, proj, plan, args, sess))
+            if not args.json:
+                print(f"Removed {plan['name']}")
+        except WtError as exc:
+            failed.append({"name": plan["name"], "error": exc.message})
+            if not args.json:
+                print(f"Failed {plan['name']}: {exc.message}", file=sys.stderr)
+    emit(args, {"applied": True, "plans": plans, "removed": removed, "failed": failed})
+    return EXIT_ERROR if failed else EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Commands: slots
+# --------------------------------------------------------------------------- #
+
+
+def cmd_slots(args) -> int:
+    proj = load_project(args.C)
+    db = open_db()
+    if args.action == "list":
+        used = {r["slot"]: r["name"] for r in project_rows(db, proj)}
+        warm = [r[0] for r in db.execute("SELECT slot FROM warm_slots WHERE project = ? ORDER BY slot", (proj.key,))]
+        data = {"used": used, "warm": warm, "warm_limit": proj.config["warm_slots"]}
+        lines = [f"{slot}  {name}" for slot, name in sorted(used.items())]
+        lines += [f"{slot}  (idle, warm)" for slot in warm]
+        emit(args, data, "\n".join(lines) or "no slots in use")
+        return EXIT_OK
+    if args.slot is None:
+        raise WtError(f"wt slots {args.action} needs a slot number", code=EXIT_USAGE)
+    slot = args.slot
+    taken = db.execute("SELECT name FROM trees WHERE project = ? AND slot = ?", (proj.key, slot)).fetchone()
+    if taken:
+        raise WtError(f"slot {slot} is used by {taken[0]}", hint=f"wt rm {taken[0]}")
+    if args.action == "warm":
+        with txn(db):
+            db.execute("INSERT OR REPLACE INTO warm_slots (project, slot, released_at) VALUES (?,?,?)",
+                       (proj.key, slot, now()))
+            event(db, proj, "slot_warm", slot=slot)
+        emit(args, {"slot": slot, "warm": True}, f"Slot {slot} is now an idle warm slot")
+        return EXIT_OK
+
+    # purge: destroy whatever the slot holds, with no tree attached
+    env = {**core_env(proj, "", "", "", slot), "WT_TEARDOWN_MODE": "destroy"}
+    result = None
+    if hook_path(proj, "teardown"):
+        result = run_hook(proj, "teardown", env={**env, "WT_DRY_RUN": "1"}, cwd=proj.root, label=f"slot-{slot}")
+        if result.rc != 0:
+            emit(args, {"applied": False, "output": result.output},
+                 f"teardown dry run for slot {slot} exited {result.rc}:\n{result.output}")
+            return EXIT_REFUSED
+    plan_text = f"Purge slot {slot}" + (f":\n{result.output.rstrip()}" if result and result.output.strip() else "")
+    if not args.yes:
+        emit(args, {"applied": False, "output": result.output if result else ""},
+             plan_text + "\nDry run. Re-run with --yes to apply.")
+        return EXIT_OK
+    if result is not None:
+        real = run_hook(proj, "teardown", env={**env, "WT_DRY_RUN": "0"}, cwd=proj.root, label=f"slot-{slot}")
+        if real.rc != 0:
+            raise WtError(f"teardown exited {real.rc}; log: {real.log}", code=EXIT_REFUSED)
+    with txn(db):
+        db.execute("DELETE FROM warm_slots WHERE project = ? AND slot = ?", (proj.key, slot))
+        event(db, proj, "slot_purged", slot=slot)
+    emit(args, {"applied": True, "slot": slot}, f"Purged slot {slot}")
+    return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Entry point
+# --------------------------------------------------------------------------- #
+
+
+def build_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("-C", metavar="DIR", help="run as if started in DIR")
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+    common.add_argument("--session", help="session id (default: $WT_SESSION_ID, $CLAUDE_CODE_SESSION_ID)")
+    common.add_argument("--pid", type=int, help="session process id (default: $WT_PID, $CLAUDE_PID)")
+    common.add_argument("-v", "--verbose", action="store_true", help="stream hook output to stderr")
+
+    parser = argparse.ArgumentParser(prog="wt", description=__doc__.split("\n\n")[0],
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"wt {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    def add(name: str, func, help_text: str) -> argparse.ArgumentParser:
+        p = sub.add_parser(name, parents=[common], help=help_text, description=help_text)
+        p.set_defaults(func=func)
+        return p
+
+    p = add("new", cmd_new, "create a tree for a story id, a branch, or a description; set it up; claim it")
+    p.add_argument("spec", nargs="+", help="sc-NNN / NNN, an existing branch, or free text")
+    p.add_argument("--name", help="tree name (default: the branch without its type prefix)")
+    p.add_argument("--base", help="start point for a new branch (default: <remote>/HEAD)")
+    p.add_argument("--type", help="branch type prefix for a new branch (default: the story type, or default_type)")
+
+    p = add("adopt", cmd_adopt, "register an existing git worktree")
+    p.add_argument("path")
+    p.add_argument("--name")
+    p.add_argument("--slot", type=int, help="use this slot (e.g. the one its resources already use)")
+    p.add_argument("--warm", action="store_true", help="tell setup the slot's resources already exist")
+    p.add_argument("--no-setup", action="store_true", help="register without running setup")
+    p.add_argument("--claim", action="store_true", help="claim it for this session")
+
+    p = add("setup", cmd_setup, "run the setup hook again for a tree")
+    p.add_argument("name", nargs="?")
+
+    p = add("claim", cmd_claim, "make a tree this session's tree")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--take-over", action="store_true", help="take it from a session that has ended")
+
+    p = add("release", cmd_release, "drop a claim without removing the tree")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--force", action="store_true", help="even if another live session holds it")
+
+    p = add("list", cmd_list, "list this project's trees and who holds them")
+    p.add_argument("--all-projects", action="store_true")
+
+    p = add("status", cmd_status, "report registry problems, each with its fix")
+    p.add_argument("--no-inventory", action="store_true", help="skip the inventory hook")
+
+    p = add("janitor", cmd_janitor, "one-line summary for a SessionStart hook; silent when all is well")
+    p.add_argument("--hook", action="store_true", help="read the hook's JSON payload from stdin")
+
+    p = add("env", cmd_env, "print a tree's environment as export lines")
+    p.add_argument("name", nargs="?")
+
+    p = add("exec", cmd_exec, "run a command in a tree with its environment: wt exec [NAME] -- CMD...")
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+
+    def removal_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--yes", action="store_true", help="apply; without it, only print the plan")
+        p.add_argument("--force", action="store_true", help="remove even with uncommitted or unpushed work")
+        p.add_argument("--destroy", action="store_true", help="destroy resources rather than keep the slot warm")
+        p.add_argument("--skip-teardown", action="store_true", help="drop the tree without running teardown")
+        p.add_argument("--delete-branch", action="store_true", help="delete the branch if git says it is merged")
+        p.add_argument("--force-delete-branch", action="store_true", help="delete the branch regardless")
+        p.add_argument("--keep-branch", action="store_true", help="keep the branch even if its PR is merged")
+        p.add_argument("--no-pr", action="store_true", help="do not ask gh about the PR")
+
+    p = add("rm", cmd_rm, "tear down and remove a tree (dry run unless --yes)")
+    p.add_argument("name")
+    removal_flags(p)
+
+    p = add("cleanup", cmd_cleanup, "remove trees whose session has ended (dry run unless --yes)")
+    p.add_argument("--stale", action="store_true", required=True, help="trees held by ended sessions")
+    p.add_argument("--include-unclaimed", action="store_true", help="also trees nobody holds")
+    removal_flags(p)
+
+    p = add("slots", cmd_slots, "list slots, or warm/purge an idle one")
+    p.add_argument("action", nargs="?", choices=["list", "warm", "purge"], default="list")
+    p.add_argument("slot", nargs="?", type=int)
+    p.add_argument("--yes", action="store_true")
+
+    p = add("log", cmd_log, "show the registry's event log")
+    p.add_argument("name", nargs="?")
+    p.add_argument("-n", "--limit", type=int, default=30)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except WtError as exc:
+        if getattr(args, "json", False):
+            print(json.dumps({"error": exc.message, "code": exc.code, "hint": exc.hint, **exc.data}, default=str))
+        else:
+            print(f"wt: {exc.message}", file=sys.stderr)
+            if exc.hint:
+                print(f"hint: {exc.hint}", file=sys.stderr)
+        return exc.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
