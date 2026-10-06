@@ -88,8 +88,9 @@ authentication query — rather than reporting "nothing to clean".
 Optional. Prints the slot numbers that have resources in reality, one per line. `wt
 status` compares that with the registry:
 
-- **LEAKED**: resources for a slot no tree or warm slot accounts for (`wt slots purge N`,
-  or `wt slots warm N` to keep them).
+- **LEAKED**: resources for a slot no tree or warm slot accounts for. If a tree still
+  uses them, `wt adopt <path> --slot N --warm`; to keep them for reuse, `wt slots warm N`;
+  to destroy them, `wt slots purge N`.
 - **COLD**: a slot recorded as warm that has no resources.
 - **UNKNOWN**: the hook failed or printed something that is not a number. Never treated
   as "nothing leaked".

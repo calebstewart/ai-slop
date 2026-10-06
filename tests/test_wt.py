@@ -623,6 +623,12 @@ class RegistryTests(Sandbox):
         self.assertEqual(json.loads(before), json.loads(after))
         ran = self.wt("-C", str(self.root), "exec", "alpha", "--", "sh", "-c", "echo $WT_SLOT", **elsewhere)
         self.assertEqual(ran.stdout.strip(), "1")
+        ran = self.wt("exec", "alpha", "-C", str(self.root), "--", "sh", "-c", "echo $WT_SLOT", **elsewhere)
+        self.assertEqual(ran.stdout.strip(), "1")
+        ran = self.wt("exec", "-C", str(self.root), "--", "sh", "-c", "echo $WT_NAME",
+                      cwd=self.tree_path("alpha"))
+        self.assertEqual(ran.stdout.strip(), "alpha")
+        self.wt("exec", "alpha", "beta", "--", "true", check=2)
 
     def test_project_is_shared_by_all_worktrees(self):
         info = self.wtj("new", "alpha")

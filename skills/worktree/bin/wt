@@ -1187,8 +1187,23 @@ def cmd_exec(args) -> int:
         names, command = rest[:cut], rest[cut + 1 :]
     else:
         names, command = [], rest
-    if len(names) > 1:
-        raise WtError("usage: wt exec [NAME] -- COMMAND...", code=EXIT_USAGE)
+    # Everything after `exec` lands in `rest`, so options given between the tree
+    # name and `--` (`wt exec NAME -C DIR -- cmd`) are parsed here.
+    pre = argparse.ArgumentParser(prog="wt exec", add_help=False, exit_on_error=False)
+    pre.add_argument("name", nargs="?")
+    pre.add_argument("-C")
+    pre.add_argument("--json", action="store_true")
+    pre.add_argument("--session")
+    pre.add_argument("--pid", type=int)
+    pre.add_argument("-v", "--verbose", action="store_true")
+    try:
+        extra = pre.parse_args(names)
+    except (argparse.ArgumentError, SystemExit) as exc:
+        raise WtError("usage: wt exec [NAME] [options] -- COMMAND...", code=EXIT_USAGE) from exc
+    for key in ("C", "session", "pid"):
+        if getattr(extra, key) is not None:
+            setattr(args, key, getattr(extra, key))
+    names = [extra.name] if extra.name else []
     if not command:
         raise WtError("no command given: wt exec [NAME] -- COMMAND...", code=EXIT_USAGE)
     proj = load_project(args.C)
@@ -1329,7 +1344,9 @@ def find_anomalies(db, proj: Project, sess: Session | None, inventory: bool) -> 
             warm = {r[0] for r in db.execute("SELECT slot FROM warm_slots WHERE project = ?", (proj.key,))}
             for slot in sorted(slots - used - warm):
                 add("LEAKED", f"slot {slot}", "resources exist but no tree uses this slot",
-                    f"{WT} slots purge {slot} --yes (or `{WT} slots warm {slot}` to keep them)")
+                    f"{WT} adopt <path> --slot {slot} --warm if a tree still uses them;"
+                    f" `{WT} slots warm {slot}` to keep them for reuse;"
+                    f" `{WT} slots purge {slot} --yes` to destroy them")
             for slot in sorted(warm - slots):
                 add("COLD", f"slot {slot}", "recorded as warm, but inventory finds no resources",
                     f"{WT} slots purge {slot} --yes")
