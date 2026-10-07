@@ -332,7 +332,10 @@
         # and real processes, so its tests are end-to-end: every test builds a
         # bare origin and a clone in a temp dir and runs wt as a subprocess.
         # Hook scripts in the tests are POSIX sh because the Linux sandbox has
-        # /bin/sh and nothing else at a fixed path.
+        # /bin/sh and nothing else at a fixed path. For the same reason wt's own
+        # `#!/usr/bin/env python3` cannot run there, and one test runs wt by its
+        # shebang (as a user would), so the tests run against a copy with
+        # patched shebangs.
         wt =
           pkgs.runCommand "check-wt"
             {
@@ -345,7 +348,10 @@
               ];
             }
             ''
-              cd ${src}
+              cp -r ${src} source
+              chmod -R u+w source
+              patchShebangs source/skills/worktree/bin
+              cd source
               HOME=$TMPDIR python3 tests/test_wt.py
               touch $out
             '';
