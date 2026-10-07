@@ -1,6 +1,6 @@
 ---
 name: worktree
-description: Works on a story, branch, or task in its own git worktree with an isolated test environment, tracked per project and per Claude session, and tears it down cleanly afterwards. Use when the user wants to start or switch work ("work on sc-123456", "start a worktree for this", "pick up that branch"), finish or remove a tree ("I'm done with this", "clean up the worktree"), see which trees exist or which session holds them, clean up trees left by ended sessions, or set up a repository's worktree hooks. Also use when a session-start message mentions wt.
+description: Manages git worktrees and their isolated test environments — creating one per story, branch, or task, tracking which Claude session holds each, and tearing them down cleanly. Use whenever worktrees come up: how many worktrees there are, what state they are in, which are stale or in use ("list my worktrees", "worktree status"), starting or switching work ("work on sc-123456", "start a worktree for this", "pick up that branch"), finishing or removing one ("I'm done with this", "clean up the worktree"), cleaning up after ended sessions, or setting up a repository's worktree hooks. Prefer it over `git worktree list`, which knows nothing about slots, sessions, or setup state. Also use when a session-start message mentions wt.
 argument-hint: "[on <story|branch|description> | off [name] | list | cleanup | init]"
 allowed-tools: Bash, AskUserQuestion, Read
 license: WTFPL-2.0
